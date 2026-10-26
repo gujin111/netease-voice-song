@@ -73,7 +73,7 @@ from . import download, library, logic, netease, netease_login, login_store
 from .config import VoiceSongConfig
 
 PLUGIN_NAME = "netease-voice-song"
-PLUGIN_VERSION = "1.9.0"
+PLUGIN_VERSION = "1.9.1"
 
 #: 临时音频文件保留多久（协议端可能还在读，不能发完就删）
 TMP_KEEP_SEC = 15 * 60
@@ -100,6 +100,9 @@ COMMAND_LOGIN = "点歌登录"
 COMMAND_LOGIN_ALIASES = ("点歌扫码", "网易云登录")
 COMMAND_LOGOUT = "点歌登出"
 COMMAND_LOGOUT_ALIASES = ("网易云登出", "点歌退出登录")
+#: 一屏看完所有指令
+COMMAND_HELP = "点歌帮助"
+COMMAND_HELP_ALIASES = ("点歌指令", "点歌命令", "点歌怎么用")
 
 #: 本插件独占的指令名（含别名）。为什么要这份清单：插件的消息钩子在宿主命令管线
 #: **之前**执行，不先让开的话「/点歌状态」会被当成点歌《状态》——所以凡是这些名字
@@ -109,10 +112,12 @@ _OWN_COMMANDS = {
     COMMAND_LIBRARY,
     COMMAND_LOGIN,
     COMMAND_LOGOUT,
+    COMMAND_HELP,
     *COMMAND_STATUS_ALIASES,
     *COMMAND_LIBRARY_ALIASES,
     *COMMAND_LOGIN_ALIASES,
     *COMMAND_LOGOUT_ALIASES,
+    *COMMAND_HELP_ALIASES,
 }
 _COMMAND_HEAD_RE = re.compile(r"^\s*/(\S+)")
 #: 指令输出上限（QQ 单条文本别太长）
@@ -1527,6 +1532,53 @@ async def _render_library(engine: Engine, *, raw_args: str = "") -> str:
     return "\n".join(lines)[:_CMD_MAX_CHARS]
 
 
+def _render_help(engine: Engine, *, is_admin: bool) -> str:
+    """``/点歌帮助``：一屏看完这个插件的所有入口。
+
+    为什么单独做一条而不是让用户翻 /help：``/help`` 只列「注册进本体命令表」的命令，
+    而这里还要交代**不带斜杠的自然说法**（点歌 / 来一首 …）和**管理员指令**
+    （解除点歌限制）——这两类都不在命令表里，翻 /help 是看不到的。
+    """
+    cfg = engine.config
+    triggers = " / ".join(cfg.trigger_list) or "（未配置）"
+    lines = [
+        "🎤 点歌发语音条 · 全部指令",
+        "",
+        "【直接说话（不用斜杠，任何会话都能用）】",
+        "  点歌 海阔天空 ｜ 来一首 海阔天空 ｜ 我想听 海阔天空",
+        "  · 触发词（必须出现在开头）：{}".format(triggers),
+        "  · 发来候选列表时，回数字（2 / 第2首）或歌手名即可",
+        "",
+        "【斜杠指令（群里 @机器人 或直接发都行；私聊直接发）】",
+        "  /点歌 歌名              找歌并发送语音条",
+        "  /点歌乐库 [关键词] [页码]   曲库清单：筛选 / 翻页（每页 20 首）",
+        "  /点歌状态               运行状态 + 网易云登录态 + 曲库规模 + 风控",
+        "  /点歌登录 [取消]         手机扫码登录网易云（管理员）",
+        "  /点歌登出               退出网易云登录（管理员）",
+        "  /点歌帮助               这一屏说明",
+        "",
+        "【管理员】",
+        "  解除点歌限制 [本群|我|QQ号] [10分钟]",
+        "  · 清掉冷却与配额；带时长 = 这段时间不再限制",
+        "",
+        "示例：/点歌乐库 周杰伦  →  /点歌乐库 2  →  /点歌 稻香",
+        "",
+        "全程 0 token：点歌与指令都不经过模型",
+    ]
+    if not is_admin:
+        lines.append("（标了「管理员」的指令需要管理员身份；可让管理员在配置里把你加进 admin_qqs）")
+    return "\n".join(lines)[:_CMD_MAX_CHARS]
+
+
+def _command_help(command_ctx: Any) -> str:
+    """``/点歌帮助``（命令管线路径）。"""
+    engine = _engine
+    if engine is None:
+        return "点歌插件还没准备好，稍后再试。"
+    user_id = str(getattr(command_ctx, "user_id", "") or "")
+    return _render_help(engine, is_admin=_is_admin(engine, user_id))
+
+
 def _command_base_name(name: str) -> str:
     if name.startswith(PLUGIN_NAME + "__"):
         return name.split("__", 1)[1]
@@ -1543,6 +1595,8 @@ async def _handle_command(
         text = await _render_status(engine, is_admin=_is_admin(engine, _sender_id(event)))
     elif base in (COMMAND_LIBRARY, *COMMAND_LIBRARY_ALIASES):
         text = await _render_library(engine, raw_args=raw_args)
+    elif base in (COMMAND_HELP, *COMMAND_HELP_ALIASES):
+        text = _render_help(engine, is_admin=_is_admin(engine, _sender_id(event)))
     elif base in (COMMAND_LOGIN, *COMMAND_LOGIN_ALIASES):
         requester = _sender_id(event)
         if not _is_admin(engine, requester):
@@ -1639,6 +1693,12 @@ def _register_commands(ctx: Any) -> None:
             pass
         return
     try:
+        registrar.register(
+            COMMAND_HELP,
+            description="一屏看完点歌插件的所有指令与自然说法",
+            usage="（无参数）",
+            aliases=COMMAND_HELP_ALIASES,
+        )(_command_help)
         registrar.register(
             COMMAND_STATUS,
             description="查看点歌插件状态：网易云登录态、曲库规模、限流与最近一次发送",

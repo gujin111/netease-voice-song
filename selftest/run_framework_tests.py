@@ -220,7 +220,7 @@ async def main():
     print("· 插件注册")
     plugin = module.plugin
     eq(plugin.name, "netease-voice-song", "插件名")
-    eq(plugin.version, "1.9.0", "版本")
+    eq(plugin.version, "1.9.1", "版本")
     eq(plugin.min_neobot_version, "2.0.0", "最低本体版本")
     rules = [item for item in plugin.messages if item.get("rule") is not None]
     eq(len(rules), 1, "一条带 rule 的消息注册")
@@ -569,12 +569,32 @@ async def main():
         print("· 指令：注册")
         registrar = module._engine.ctx.app_commands
         names = set(registrar.commands)
-        check(names >= {"点歌状态", "点歌乐库", "点歌登录", "点歌登出"}, "四个指令都注册了", names)
+        check(names >= {"点歌状态", "点歌乐库", "点歌登录", "点歌登出", "点歌帮助"}, "五个指令都注册了", names)
         status_cmd = registrar.commands["点歌状态"]
         library_cmd = registrar.commands["点歌乐库"]
         check("点歌登录" not in (status_cmd.get("aliases") or ()), "点歌登录 不再是状态指令的别名", status_cmd.get("aliases"))
         check("点歌列表" in (library_cmd.get("aliases") or ()), "乐库指令有别名 /点歌列表", library_cmd.get("aliases"))
         check("点歌扫码" in (registrar.commands["点歌登录"].get("aliases") or ()), "登录指令有别名", registrar.commands["点歌登录"].get("aliases"))
+        help_cmd = registrar.commands["点歌帮助"]
+        check("点歌指令" in (help_cmd.get("aliases") or ()), "帮助指令有别名 /点歌指令", help_cmd.get("aliases"))
+        check("指令" in (help_cmd.get("description") or ""), "帮助指令有说明", help_cmd.get("description"))
+
+        print("· 指令：一屏看完所有入口")
+        help_text = module._render_help(module._engine, is_admin=True)
+        for token in ("/点歌 歌名", "/点歌乐库", "/点歌状态", "/点歌登录", "/点歌登出", "/点歌帮助", "解除点歌限制"):
+            check(token in help_text, "帮助里有 " + token, help_text[:80])
+        check("点歌 / 来一首" in help_text, "帮助里带上了可配置的触发词", help_text[:200])
+        guest_help = module._render_help(module._engine, is_admin=False)
+        check("admin_qqs" in guest_help, "普通群友会看到「找管理员」的提示", guest_help[-120:])
+        check(len(help_text) <= module._CMD_MAX_CHARS, "帮助长度在上限内", len(help_text))
+
+        no_at_help = text_event("/点歌帮助", user_id=456, message_id=607)
+        eq(module._message_rule(no_at_help), True, "群里没 @ 时帮助指令也兜住")
+        sent_before = len(ctx.sent)
+        await module._on_message(no_at_help, ctx, config)
+        await drain(module)
+        new_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
+        check(any("全部指令" in line for line in new_text), "兜底路径回了帮助正文", new_text)
         check(bool(status_cmd.get("description")), "状态指令有说明（/help 会显示）")
         check("关键词" in (library_cmd.get("usage") or ""), "乐库指令写了用法", library_cmd.get("usage"))
 
