@@ -1,0 +1,110 @@
+name = "netease-voice-song"
+repo = "gujin111/netease-voice-song"
+branch = "main"
+version = "1.7.0"
+description = "点歌发语音条：群里说「点歌 歌名」，本地曲库优先，没有就去网易云下载完整歌曲，再以 QQ 语音条发出来"
+author = "DSH（NeoBot 移植）"
+dependencies = []
+priority = 0
+min_neobot_version = "2.0.0"
+hot_reload = true
+config_hot_reload = true
+license = "MIT"
+tags = ["media", "music", "voice", "netease", "点歌"]
+
+# 运行配置在插件数据目录 plugins_data/netease-voice-song/config.toml（面板可编辑），
+# 本表只提供打包默认值，插件升级不会覆盖你改过的值。
+[config]
+# 关掉后一条都不发：消息钩子会直接放行，模型照常接话，零副作用。
+enabled = true
+
+# ── 识别 ──
+# 触发词，用 | 或逗号分隔。这些词出现在消息开头才算点歌（例如「点歌」「来一首」「我想听」）。
+triggers = "点歌|来一首|来首|放一首|放首|我想听|想听"
+# 机器人别名，用逗号分隔，可留空。填了「小鲸鱼，来一首 xx」也能认；@机器人 不用填。
+self_names = ""
+
+# ── 找歌 ──
+# 音乐文件夹，一行一个，可留空。留空 = 只用默认位置与下载缓存。
+search_directories = ""
+# 开 = 除上面填的，还去「我的音乐 / 网易云下载目录 / 桌面 / D:\CloudMusic」等常见位置找。
+default_scan_dirs = true
+# 扫描音乐文件夹时往下钻几层（0~6）。
+scan_depth = 3
+# 一次扫描最多看多少个音频文件（100~40000），防目录太大卡住收消息。
+max_files = 4000
+# 开 = 歌名不完全一致也能找到；关 = 只认明确包含歌名的文件，更不容易放错歌。
+fuzzy = true
+
+# ── 自动下载 ──
+# 开（默认）= 本地找不到时去网易云下载完整歌曲再发语音条；关 = 只发本地已有的歌。
+enable_download = true
+# 下载缓存目录，留空用默认（我的音乐\CloudMusic\点歌缓存）。会一起纳入找歌范围。
+download_dir = ""
+# standard=标准 128kbps；exhigh=较高 320kbps（推荐）；lossless=无损 FLAC。
+quality = "exhigh"
+# 单个文件超过这个体积就不下。用无损音质时建议调到 60 以上。
+download_max_mb = 25
+# 单首歌下载的最长时间（秒）。
+download_timeout_sec = 60
+# 按歌名去网易云搜，取前 N 条再按匹配度挑最像的。
+search_limit = 5
+# 开 = 缓存目录里已有的歌直接发，不重复下载。
+reuse_downloaded = true
+
+# ── 登录态 ──
+# 开 = 从本机已登录的网易云客户端读登录 cookie（只读、不写、不改客户端）。
+use_client_cookie = true
+# 手动填 cookie（可留空）。留空 = 用上面的自动读取；留空不会覆盖已有值。
+cookie_secret = ""
+
+# ── 同名多首 ──
+# 开（默认）= 任何一次点歌都先发候选列表，点歌的人回数字之后才真正放歌。
+always_ask = true
+# 开 = 有几首难分高下时先发列表让人选；关 = 直接挑最匹配的那首发。
+ask_when_ambiguous = true
+# 前两名分数差在这个比例以内就认为分不出高下（0.5~1，默认 0.92）。
+ambiguity_ratio = 0.92
+# 候选列表最多列几首（2~10）。
+max_choices = 8
+# 列表发出后多久内回数字有效（秒）。
+choice_ttl_sec = 180
+
+# ── 管理员解除限制 ──
+# 开 = 管理员可以发指令清掉冷却与配额记录，也可以临时开一段「不限制」。
+unlock_enabled = true
+# 机主/管理员 QQ 号，逗号分隔。留空则只认 NeoBot 自己的管理员配置。
+admin_qqs = ""
+# 开 = 另外去问 NeoBot 的权限体系，超级管理员与次级管理员也能解除限制。
+trust_admin_accounts = true
+# 指令不带时长时，默认放开几分钟（0 = 只清记录、不开豁免）。
+unlock_default_min = 10
+# 解除指令的触发词，用 | 分隔。除内置写法外，这里列的短语也算解除指令；
+# 后面可跟范围与时长，例如「解除点歌限制 本群 30分钟」。别填成「点歌」这类常用词。
+unlock_command = "解除点歌限制|解除限制|清除点歌冷却|重置点歌配额|解除点歌限流"
+
+# ── 发送 ──
+# 超过就跳过不发（默认 20MB）。无损 FLAC 常超过这个值，用无损时记得一起调大。
+max_file_mb = 20
+# 开 = 语音条发完跟一行「🎵 《歌名》— 歌手」。
+reply_title = true
+# 开 = 没找到、下载失败时回一句说明原因；关（默认）= 安静处理，原因仍记日志。
+reply_on_failure = false
+
+# ── 防刷屏 ──
+# 同一个群/好友两次点歌的最小间隔（秒），0 = 不冷却。
+cooldown_sec = 20
+# 同一个群/好友每小时最多发几首，0 = 不限。
+max_per_chat_hour = 10
+# 所有会话加起来每小时最多发几首，0 = 不限。
+max_per_hour = 30
+# 同一个人每小时最多点几首，0 = 不限。
+max_per_user_hour = 5
+# 同一首歌在这个时间内不重复下载（分钟），0 = 不冷却。
+download_cooldown_min = 10
+# 所有会话合计每小时最多下载几首，0 = 不限。
+download_per_hour = 20
+
+# ── 高级 ──
+# 联网搜索结果的最低分闸。低于它宁可「没找到」也不放错歌，一般不用改。
+match_min_score = 430
