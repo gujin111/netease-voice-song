@@ -220,7 +220,7 @@ async def main():
     print("· 插件注册")
     plugin = module.plugin
     eq(plugin.name, "netease-voice-song", "插件名")
-    eq(plugin.version, "1.9.1", "版本")
+    eq(plugin.version, "1.9.2", "版本")
     eq(plugin.min_neobot_version, "2.0.0", "最低本体版本")
     rules = [item for item in plugin.messages if item.get("rule") is not None]
     eq(len(rules), 1, "一条带 rule 的消息注册")
@@ -566,37 +566,26 @@ async def main():
             eq(ctx.audio[-1][0].kind, "private", "发到私聊会话")
             eq(ctx.audio[-1][0].id, "789", "会话 id 是对方 QQ")
 
-        print("· 指令：注册")
+        print("· 指令：命名空间（vs-*，不与歌名混）")
         registrar = module._engine.ctx.app_commands
         names = set(registrar.commands)
-        check(names >= {"点歌状态", "点歌乐库", "点歌登录", "点歌登出", "点歌帮助"}, "五个指令都注册了", names)
-        status_cmd = registrar.commands["点歌状态"]
-        library_cmd = registrar.commands["点歌乐库"]
-        check("点歌登录" not in (status_cmd.get("aliases") or ()), "点歌登录 不再是状态指令的别名", status_cmd.get("aliases"))
-        check("点歌列表" in (library_cmd.get("aliases") or ()), "乐库指令有别名 /点歌列表", library_cmd.get("aliases"))
-        check("点歌扫码" in (registrar.commands["点歌登录"].get("aliases") or ()), "登录指令有别名", registrar.commands["点歌登录"].get("aliases"))
-        help_cmd = registrar.commands["点歌帮助"]
-        check("点歌指令" in (help_cmd.get("aliases") or ()), "帮助指令有别名 /点歌指令", help_cmd.get("aliases"))
-        check("指令" in (help_cmd.get("description") or ""), "帮助指令有说明", help_cmd.get("description"))
+        expected = {"vs-help", "vs-status", "vs-library", "vs-login", "vs-logout"}
+        check(names >= expected, "五个 vs-* 指令都注册了", names)
+        check(not any(name.startswith("点歌") for name in names), "没有任何指令以「点歌」开头", names)
+        check("vs" in (registrar.commands["vs-help"].get("aliases") or ()), "/vs 是帮助的简写")
+        check("vs-lib" in (registrar.commands["vs-library"].get("aliases") or ()), "曲库指令有别名 /vs-lib")
+        check("vs-qr" in (registrar.commands["vs-login"].get("aliases") or ()), "登录指令有别名 /vs-qr")
+        check("指令" in (registrar.commands["vs-help"].get("description") or ""), "帮助指令有说明")
 
         print("· 指令：一屏看完所有入口")
         help_text = module._render_help(module._engine, is_admin=True)
-        for token in ("/点歌 歌名", "/点歌乐库", "/点歌状态", "/点歌登录", "/点歌登出", "/点歌帮助", "解除点歌限制"):
+        for token in ("/vs-help", "/vs-status", "/vs-library", "/vs-login", "/vs-logout",
+                      "/点歌 海阔天空", "解除点歌限制"):
             check(token in help_text, "帮助里有 " + token, help_text[:80])
         check("点歌 / 来一首" in help_text, "帮助里带上了可配置的触发词", help_text[:200])
+        check(len(help_text) <= module._CMD_MAX_CHARS, "帮助长度在上限内", len(help_text))
         guest_help = module._render_help(module._engine, is_admin=False)
         check("admin_qqs" in guest_help, "普通群友会看到「找管理员」的提示", guest_help[-120:])
-        check(len(help_text) <= module._CMD_MAX_CHARS, "帮助长度在上限内", len(help_text))
-
-        no_at_help = text_event("/点歌帮助", user_id=456, message_id=607)
-        eq(module._message_rule(no_at_help), True, "群里没 @ 时帮助指令也兜住")
-        sent_before = len(ctx.sent)
-        await module._on_message(no_at_help, ctx, config)
-        await drain(module)
-        new_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
-        check(any("全部指令" in line for line in new_text), "兜底路径回了帮助正文", new_text)
-        check(bool(status_cmd.get("description")), "状态指令有说明（/help 会显示）")
-        check("关键词" in (library_cmd.get("usage") or ""), "乐库指令写了用法", library_cmd.get("usage"))
 
         print("· 指令：状态 与 登录态")
         class Cmd:
@@ -626,7 +615,7 @@ async def main():
         library_text = await module._command_library(Cmd(""))
         check("曲库 1 首" in library_text, "列表显示总数", library_text)
         check("1. 海阔天空" in library_text, "列表里有那首歌", library_text)
-        check("/点歌乐库" in library_text, "给了翻页/筛选提示", library_text)
+        check("/vs-library" in library_text or "翻页" in library_text, "给了翻页/筛选提示", library_text)
         hit_text = await module._command_library(Cmd("海阔"))
         check("筛选「海阔」命中 1 首" in hit_text, "关键词筛选", hit_text)
         miss_text = await module._command_library(Cmd("不存在的歌"))
@@ -635,9 +624,31 @@ async def main():
         check("1. 海阔天空" in page_text, "越界页码回到最后一页（仍能列出内容）", page_text)
         check("第 1/1 页" not in page_text, "只有一页时不显示页码行", page_text)
 
-        print("· 指令不会被子点歌钩子吃掉")
-        # 群里没 @机器人 → 插件自己回
-        no_at = text_event("/点歌状态", user_id=456, message_id=601)
+        print("· 指令：点和「点歌」开头的消息不再冲突")
+        # 旧指令名 → 提示改名（不能被当成「点一首叫《状态》的歌」）
+        eq(module._legacy_command_target("/点歌状态"), "vs-status", "旧名 /点歌状态 → vs-status")
+        eq(module._legacy_command_target("/点歌登录 取消"), "vs-login", "旧名带参数也认得")
+        eq(module._legacy_command_target("/点歌 状态"), "", "带空格的「/点歌 状态」是真点歌，不算旧指令")
+        eq(module._legacy_command_target("/点歌海阔天空"), "", "「/点歌海阔天空」不算旧指令")
+
+        legacy = text_event("/点歌状态", user_id=456, message_id=608)
+        eq(module._message_rule(legacy), True, "旧指令会被接管（给提示，而不是放歌）")
+        audio_before = len(ctx.audio)
+        sent_before = len(ctx.sent)
+        await module._on_message(legacy, ctx, config)
+        await drain(module)
+        hint_lines = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
+        check(any("/vs-status" in line for line in hint_lines), "提示里给了新指令名", hint_lines)
+        eq(len(ctx.audio), audio_before, "旧指令没有被当成点歌放歌")
+
+        # 带空格的「点歌 状态」仍然是点歌请求（歌名就叫「状态」）
+        spaced = text_event("/点歌 状态", message_id=609)
+        eq(module._message_rule(spaced), True, "「/点歌 状态」当点歌处理")
+        check(module._decide(spaced) == "song", "判定为点歌而不是旧指令", module._decide(spaced))
+
+        print("· 指令：vs-* 的接管语义")
+        # 群里没 @机器人 → 插件兜住
+        no_at = text_event("/vs-status", user_id=456, message_id=601)
         eq(module._message_rule(no_at), True, "群里没 @ 时由插件兜住指令")
         audio_before = len(ctx.audio)
         sent_before = len(ctx.sent)
@@ -647,13 +658,21 @@ async def main():
         check(any("点歌发语音条" in line for line in new_text), "兜底路径真的回了状态", new_text)
         eq(len(ctx.audio), audio_before, "指令没被当成点歌放歌")
 
-        no_at_lib = text_event("/点歌乐库", user_id=456, message_id=602)
+        no_at_lib = text_event("/vs-library", user_id=456, message_id=602)
         eq(module._message_rule(no_at_lib), True, "乐库指令同样兜住")
         sent_before = len(ctx.sent)
         await module._on_message(no_at_lib, ctx, config)
         await drain(module)
         new_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
         check(any("曲库 1 首" in line for line in new_text), "乐库兜底输出", new_text)
+
+        no_at_help = text_event("/vs-help", user_id=456, message_id=607)
+        eq(module._message_rule(no_at_help), True, "群里没 @ 时帮助指令也兜住")
+        sent_before = len(ctx.sent)
+        await module._on_message(no_at_help, ctx, config)
+        await drain(module)
+        new_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
+        check(any("全部指令" in line for line in new_text), "兜底路径回了帮助正文", new_text)
 
         # 群里 @了机器人 → 让给命令管线（否则会出现两条回复）
         mentioned = {
@@ -665,15 +684,15 @@ async def main():
             "self_id": 10000,
             "message": [
                 {"type": "at", "data": {"qq": "10000"}},
-                {"type": "text", "data": {"text": " /点歌状态"}},
+                {"type": "text", "data": {"text": " /vs-status"}},
             ],
         }
         eq(module._message_rule(mentioned), False, "@了机器人时应让给命令管线")
         # 私聊不需要 @ → 也让给命令管线
-        eq(module._message_rule(text_event("/点歌状态", private=True, message_id=604)), False, "私聊让给命令管线")
+        eq(module._message_rule(text_event("/vs-status", private=True, message_id=604)), False, "私聊让给命令管线")
         # 别的 / 命令：不接管
         eq(module._message_rule(text_event("/help", message_id=605)), False, "别人的指令不接管")
-        # 斜杠点歌仍然照常（它不属于本插件注册的指令）
+        # 斜杠点歌仍然照常
         slash_song = text_event("/点歌 海阔天空", message_id=606)
         eq(module._message_rule(slash_song), True, "/点歌 歌名 仍走点歌钩子")
         module._engine.gate.reset("group:123", "456", "all")
@@ -681,7 +700,6 @@ async def main():
         await module._on_message(slash_song, ctx, config)
         await drain(module)
         eq(len(ctx.audio), before_audio + 1, "斜杠点歌真的发了语音条")
-
         print("· 扫码登录：登录态存储")
         store = module.login_store
         login_dir = temp / "login"

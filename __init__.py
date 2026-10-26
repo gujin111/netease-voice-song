@@ -73,7 +73,7 @@ from . import download, library, logic, netease, netease_login, login_store
 from .config import VoiceSongConfig
 
 PLUGIN_NAME = "netease-voice-song"
-PLUGIN_VERSION = "1.9.1"
+PLUGIN_VERSION = "1.9.2"
 
 #: 临时音频文件保留多久（协议端可能还在读，不能发完就删）
 TMP_KEEP_SEC = 15 * 60
@@ -90,22 +90,44 @@ TURN_PLAY_TTL_SEC = 600
 
 # ── QQ 指令 ──
 #: 状态 / 登录态
-COMMAND_STATUS = "点歌状态"
-COMMAND_STATUS_ALIASES = ("点歌状态查询",)
-#: 曲库
-COMMAND_LIBRARY = "点歌乐库"
-COMMAND_LIBRARY_ALIASES = ("点歌列表", "点歌曲库")
-#: 扫码登录 / 退出登录（1.9.0 起取代「读本机客户端 cookie」）
-COMMAND_LOGIN = "点歌登录"
-COMMAND_LOGIN_ALIASES = ("点歌扫码", "网易云登录")
-COMMAND_LOGOUT = "点歌登出"
-COMMAND_LOGOUT_ALIASES = ("网易云登出", "点歌退出登录")
-#: 一屏看完所有指令
-COMMAND_HELP = "点歌帮助"
-COMMAND_HELP_ALIASES = ("点歌指令", "点歌命令", "点歌怎么用")
+#
+# ⚠️ 命名空间刻意**不用**「点歌」开头：
+#    1.9.1 及以前叫 /点歌登录、/点歌状态，结果「/点歌登录」既像指令、又像
+#    「点一首叫《登录》的歌」—— 用户没法从字面分辨。现在点歌只负责放歌，
+#    其余全部收进 `vs-*`（voice-song）命名空间，一眼就知道不是歌名。
+COMMAND_HELP = "vs-help"
+COMMAND_HELP_ALIASES = ("vs",)
+COMMAND_STATUS = "vs-status"
+COMMAND_STATUS_ALIASES = ()
+COMMAND_LIBRARY = "vs-library"
+COMMAND_LIBRARY_ALIASES = ("vs-lib",)
+COMMAND_LOGIN = "vs-login"
+COMMAND_LOGIN_ALIASES = ("vs-qr",)
+COMMAND_LOGOUT = "vs-logout"
+COMMAND_LOGOUT_ALIASES = ()
+
+#: 1.9.1 及以前的旧指令名 → 现在该用的名字。发旧名字时提示改名，
+#: 而不是把它当成「点一首叫《状态》的歌」。
+_LEGACY_COMMAND_MAP = {
+    "点歌帮助": COMMAND_HELP,
+    "点歌指令": COMMAND_HELP,
+    "点歌命令": COMMAND_HELP,
+    "点歌怎么用": COMMAND_HELP,
+    "点歌状态": COMMAND_STATUS,
+    "点歌状态查询": COMMAND_STATUS,
+    "点歌乐库": COMMAND_LIBRARY,
+    "点歌列表": COMMAND_LIBRARY,
+    "点歌曲库": COMMAND_LIBRARY,
+    "点歌登录": COMMAND_LOGIN,
+    "点歌扫码": COMMAND_LOGIN,
+    "网易云登录": COMMAND_LOGIN,
+    "点歌登出": COMMAND_LOGOUT,
+    "网易云登出": COMMAND_LOGOUT,
+    "点歌退出登录": COMMAND_LOGOUT,
+}
 
 #: 本插件独占的指令名（含别名）。为什么要这份清单：插件的消息钩子在宿主命令管线
-#: **之前**执行，不先让开的话「/点歌状态」会被当成点歌《状态》——所以凡是这些名字
+#: **之前**执行，不先让开的话「/vs-status」会被当成点歌《状态》——所以凡是这些名字
 #: 开头的 "/" 消息，一律先交给命令管线（见 _is_own_command / _command_will_handle）。
 _OWN_COMMANDS = {
     COMMAND_STATUS,
@@ -1131,7 +1153,7 @@ async def _handle_unlock(
     await _reply_quiet(engine, ctx, conversation, "\n".join(lines))
 
 
-# ───────────────────────────────────────────── 扫码登录（/点歌登录）
+# ───────────────────────────────────────────── 扫码登录（/vs-login）
 
 class _Reply:
     """把「发文本 / 发图片」抽象出来，命令路径与钩子路径共用同一套登录流程。"""
@@ -1210,7 +1232,7 @@ async def _start_login(engine: Engine, sender: _Reply, *, requester: str, chat_k
         left = int(current.timeout_sec - (_now() - current.started_at))
         await sender.text(
             "已经有一个登录流程在进行中（还有约 {} 秒）。\n"
-            "扫码后在手机上确认即可；想重来就发「/点歌登录 取消」，再发一次。".format(left)
+            "扫码后在手机上确认即可；想重来就发「/vs-login 取消」，再发一次。".format(left)
         )
         return
 
@@ -1282,7 +1304,7 @@ async def _poll_login(engine: Engine, session: LoginSession) -> None:
 
             if state == netease_login.STATE_EXPIRED:
                 engine.login = None
-                await session.sender.text("⌛ 二维码已失效，请重新发 /点歌登录。")
+                await session.sender.text("⌛ 二维码已失效，请重新发 /vs-login。")
                 return
 
             if state == netease_login.STATE_FAILED:
@@ -1299,7 +1321,7 @@ async def _poll_login(engine: Engine, session: LoginSession) -> None:
         if engine.login is session:
             engine.login = None
             await session.sender.text(
-                "⌛ 等太久了（{} 秒），二维码已作废。需要的话重新发 /点歌登录。".format(
+                "⌛ 等太久了（{} 秒），二维码已作废。需要的话重新发 /vs-login。".format(
                     int(session.timeout_sec)
                 )
             )
@@ -1324,7 +1346,7 @@ def _login_state_text(engine: Engine) -> Tuple[str, bool]:
         return "✅ 使用设置里手填的 cookie", True
     if cfg.use_client_cookie:
         return "⚠ 未扫码；当前会尝试读本机客户端（旧方式）", False
-    return "⚠ 未登录 —— 发 /点歌登录 用手机扫码", False
+    return "⚠ 未登录 —— 发 /vs-login 用手机扫码", False
 
 
 # ───────────────────────────────────────────── QQ 指令：状态 / 登录态 / 曲库
@@ -1365,7 +1387,7 @@ def _parse_library_args(raw: str) -> Tuple[str, int]:
 
 
 async def _render_status(engine: Engine, *, is_admin: bool) -> str:
-    """``/点歌状态`` 的正文。
+    """``/vs-status`` 的正文。
 
     为什么分管理员/普通两档：登录态来自哪个文件、下载目录、上次错误的完整文案
     都属于「内部状态 → 群里可见」的泄露面。普通群友只看到「可用/不可用」就够了。
@@ -1396,7 +1418,7 @@ async def _render_status(engine: Engine, *, is_admin: bool) -> str:
                 )
             )
         else:
-            lines.append("  未登录时只能放本地曲库；发 /点歌登录 用手机扫码即可下载完整歌曲")
+            lines.append("  未登录时只能放本地曲库；发 /vs-login 用手机扫码即可下载完整歌曲")
         risk = netease.risk_status()
         if risk["risk_cooldown_left"] > 0:
             lines.append(
@@ -1472,12 +1494,12 @@ async def _render_status(engine: Engine, *, is_admin: bool) -> str:
 
     text = "\n".join(lines)
     if not is_admin:
-        text += "\n\n（管理员可看更详细的路径/登录来源：/点歌状态）"
+        text += "\n\n（管理员可看更详细的路径/登录来源：/vs-status）"
     return text[:_CMD_MAX_CHARS]
 
 
 async def _render_library(engine: Engine, *, raw_args: str = "") -> str:
-    """``/点歌乐库`` 的正文：按文件名筛选、分页，只给当前页读 ID3 标签。"""
+    """``/vs-library`` 的正文：按文件名筛选、分页，只给当前页读 ID3 标签。"""
     roots = _scan_roots(engine)
     files = await _load_library(engine, roots)
     if not files:
@@ -1524,16 +1546,16 @@ async def _render_library(engine: Engine, *, raw_args: str = "") -> str:
         lines.append("{}. {}{}".format(index, name, " — " + artist if artist else ""))
     hints: List[str] = []
     if total_pages > 1:
-        hints.append("翻页：/点歌乐库 {}".format(page + 1 if page < total_pages else 1))
+        hints.append("翻页：/{0} {1}".format(COMMAND_LIBRARY, page + 1 if page < total_pages else 1))
     if not keyword:
-        hints.append("筛选：/点歌乐库 关键词")
+        hints.append("筛选：/{} 关键词".format(COMMAND_LIBRARY))
     hints.append("点歌：/点歌 歌名")
     lines.append("｜".join(hints))
     return "\n".join(lines)[:_CMD_MAX_CHARS]
 
 
 def _render_help(engine: Engine, *, is_admin: bool) -> str:
-    """``/点歌帮助``：一屏看完这个插件的所有入口。
+    """``/vs-help``：一屏看完这个插件的所有入口。
 
     为什么单独做一条而不是让用户翻 /help：``/help`` 只列「注册进本体命令表」的命令，
     而这里还要交代**不带斜杠的自然说法**（点歌 / 来一首 …）和**管理员指令**
@@ -1544,24 +1566,27 @@ def _render_help(engine: Engine, *, is_admin: bool) -> str:
     lines = [
         "🎤 点歌发语音条 · 全部指令",
         "",
-        "【直接说话（不用斜杠，任何会话都能用）】",
+        "【点歌（放歌只用这一种，任何会话）】",
         "  点歌 海阔天空 ｜ 来一首 海阔天空 ｜ 我想听 海阔天空",
         "  · 触发词（必须出现在开头）：{}".format(triggers),
-        "  · 发来候选列表时，回数字（2 / 第2首）或歌手名即可",
+        "  · 也可以带斜杠：/点歌 海阔天空",
+        "  · 出候选列表时，回数字（2 / 第2首）或歌手名即可",
         "",
-        "【斜杠指令（群里 @机器人 或直接发都行；私聊直接发）】",
-        "  /点歌 歌名              找歌并发送语音条",
-        "  /点歌乐库 [关键词] [页码]   曲库清单：筛选 / 翻页（每页 20 首）",
-        "  /点歌状态               运行状态 + 网易云登录态 + 曲库规模 + 风控",
-        "  /点歌登录 [取消]         手机扫码登录网易云（管理员）",
-        "  /点歌登出               退出网易云登录（管理员）",
-        "  /点歌帮助               这一屏说明",
+        "【其它指令：英文 vs-* 命名空间（和歌名不会混）】",
+        "  /vs-help                这一屏说明（简写 /vs）",
+        "  /vs-status              登录态 + 曲库规模 + 限流与风控",
+        "  /vs-library [关键词] [页码]  曲库清单：筛选 / 翻页（每页 20 首）",
+        "  /vs-login [取消]        手机扫码登录网易云（管理员）",
+        "  /vs-logout              退出网易云登录（管理员）",
         "",
         "【管理员】",
         "  解除点歌限制 [本群|我|QQ号] [10分钟]",
         "  · 清掉冷却与配额；带时长 = 这段时间不再限制",
         "",
-        "示例：/点歌乐库 周杰伦  →  /点歌乐库 2  →  /点歌 稻香",
+        "示例：/vs-library 周杰伦  →  /vs-library 2  →  /点歌 稻香",
+        "",
+        "为什么不用「/点歌登录」这种名字：它会和「点一首叫《登录》的歌」分不开。",
+        "旧的 /点歌状态、/点歌登录 等已停用，发出来会提示改用哪个 /vs-* 指令。",
         "",
         "全程 0 token：点歌与指令都不经过模型",
     ]
@@ -1571,7 +1596,7 @@ def _render_help(engine: Engine, *, is_admin: bool) -> str:
 
 
 def _command_help(command_ctx: Any) -> str:
-    """``/点歌帮助``（命令管线路径）。"""
+    """``/vs-help``（命令管线路径）。"""
     engine = _engine
     if engine is None:
         return "点歌插件还没准备好，稍后再试。"
@@ -1630,7 +1655,7 @@ async def _handle_command(
 
 
 async def _command_status(command_ctx: Any) -> str:
-    """``/点歌状态``（命令管线路径）。"""
+    """``/vs-status``（命令管线路径）。"""
     engine = _engine
     if engine is None:
         return "点歌插件还没准备好，稍后再试。"
@@ -1639,7 +1664,7 @@ async def _command_status(command_ctx: Any) -> str:
 
 
 async def _command_library(command_ctx: Any) -> str:
-    """``/点歌乐库 [关键词] [页码]``（命令管线路径）。"""
+    """``/vs-library [关键词] [页码]``（命令管线路径）。"""
     engine = _engine
     if engine is None:
         return "点歌插件还没准备好，稍后再试。"
@@ -1649,7 +1674,7 @@ async def _command_library(command_ctx: Any) -> str:
 
 
 async def _command_login(command_ctx: Any) -> Any:
-    """``/点歌登录 [取消]``：发二维码让手机扫码。"""
+    """``/vs-login [取消]``：发二维码让手机扫码。"""
     engine = _engine
     if engine is None:
         return "点歌插件还没准备好，稍后再试。"
@@ -1668,7 +1693,7 @@ async def _command_login(command_ctx: Any) -> Any:
 
 
 async def _command_logout(command_ctx: Any) -> str:
-    """``/点歌登出``：删掉保存的登录态。"""
+    """``/vs-logout``：删掉保存的登录态。"""
     engine = _engine
     if engine is None:
         return "点歌插件还没准备好，稍后再试。"
@@ -1677,7 +1702,7 @@ async def _command_logout(command_ctx: Any) -> str:
         return "退出登录只允许管理员操作。"
     await _cancel_login(engine)
     login_store.clear(engine.data_dir)
-    return "已退出网易云登录（本机保存的 cookie 已删除）。需要时重新发 /点歌登录 扫码。"
+    return "已退出网易云登录（本机保存的 cookie 已删除）。需要时重新发 /vs-login 扫码。"
 
 
 def _register_commands(ctx: Any) -> None:
@@ -1686,7 +1711,7 @@ def _register_commands(ctx: Any) -> None:
     if registrar is None or not getattr(registrar, "available", False):
         try:
             ctx.logger.warning(
-                "宿主没有提供命令注册表（app_commands 不可用），/点歌状态 等指令未注册；"
+                "宿主没有提供命令注册表（app_commands 不可用），/vs-* 指令未注册；"
                 "自然语言点歌不受影响"
             )
         except Exception:
@@ -1735,6 +1760,27 @@ def _register_commands(ctx: Any) -> None:
 # ───────────────────────────────────────────── 接管判定（同步、零 IO）
 
 
+def _legacy_command_target(text: str) -> str:
+    """``/点歌登录`` 这类**旧指令名** → 现在该用的 ``/vs-*``；不是旧指令返回空串。
+
+    ⚠️ 只认「斜杠 + 一个旧名字」这种形态，**不认带空格的**「/点歌 状态」——
+       后者是真·点歌请求（歌名就叫「状态」），不能抢。
+    """
+    name, _ = _parse_command(text)
+    if not name:
+        return ""
+    return _LEGACY_COMMAND_MAP.get(name, "")
+
+
+def _render_legacy_hint(target: str) -> str:
+    return (
+        "「/点歌登录」这类旧指令已经改名了 —— 它原来会和「点一首叫《登录》的歌」分不开。\n"
+        "按你的意思，这次应该用：/{}\n\n"
+        "现在全部指令：/vs-help · /vs-status · /vs-library · /vs-login · /vs-logout\n"
+        "点歌本身没变：直接发「点歌 歌名」，或 /点歌 歌名。".format(target)
+    )
+
+
 def _parse_command(text: str) -> Tuple[str, str]:
     """把 ``/名字 参数`` 拆成 (名字, 参数)。不是指令形态就返回 ("", 原文)。"""
     match = _COMMAND_HEAD_RE.match(text or "")
@@ -1746,7 +1792,7 @@ def _parse_command(text: str) -> Tuple[str, str]:
 def _is_own_command(text: str) -> bool:
     """这条消息是不是本插件的 /指令？
 
-    重名时宿主会把命令自动改名为 ``netease-voice-song__点歌状态``，
+    重名时宿主会把命令自动改名为 ``netease-voice-song__vs-status``，
     所以带前缀的形式也认。
     """
     name, _ = _parse_command(text)
@@ -1811,6 +1857,11 @@ def _decide(event: Dict[str, Any]) -> str:
             return ""
         chat_key = _conversation_key(event)
         sender_id = _sender_id(event)
+
+        # ⓪-1 旧指令名（/点歌登录 等）：提示改名，别当成歌名
+        legacy = _legacy_command_target(text)
+        if legacy:
+            return "moved"
 
         # ⓪ 本插件的 /指令
         #    ⚠️ 必须排在点歌之前：钩子比命令管线先跑，不让开的话
@@ -1926,6 +1977,13 @@ def _dispatch(engine: Engine, kind: str, ctx: Any, event: Dict[str, Any]) -> Non
                 await _handle_choice(engine, ctx, event, conversation, chat_key)
             elif kind == "cmd":
                 await _handle_command(engine, ctx, event, conversation, chat_key)
+            elif kind == "moved":
+                await _reply_quiet(
+                    engine,
+                    ctx,
+                    conversation,
+                    _render_legacy_hint(_legacy_command_target(Message(event).text)),
+                )
             else:
                 await _handle_song(engine, ctx, event, conversation, chat_key)
 
@@ -1946,7 +2004,7 @@ plugin = Plugin(
     ),
     usage=(
         "直接发「点歌 歌名」/「来一首 歌名」；"
-        "指令：/点歌登录（手机扫码）、/点歌状态、/点歌乐库 [关键词] [页码]、/点歌登出；"
+        "指令：/vs-login（手机扫码）、/vs-status、/vs-library [关键词] [页码]、/vs-logout、/vs-help；"
         "管理员可发「解除点歌限制 [本群|我|QQ号] [10分钟]」"
     ),
     author="DSH（NeoBot 移植）",
@@ -2399,7 +2457,7 @@ async def _on_load(ctx: Any, config: VoiceSongConfig, logger: Any) -> None:
     cfg = engine.config
     # 请求节流是「降风控」的第一道闸，按配置生效
     netease.set_min_interval(cfg.netease_min_interval_sec)
-    # 上次扫码登录的结果落在这里；没有就等用户发 /点歌登录
+    # 上次扫码登录的结果落在这里；没有就等用户发 /vs-login
     saved_login = login_store.bootstrap(engine.data_dir)
     if saved_login:
         logger.info(
@@ -2408,7 +2466,7 @@ async def _on_load(ctx: Any, config: VoiceSongConfig, logger: Any) -> None:
             )
         )
     else:
-        logger.info("网易云登录态：还没有登录（发 /点歌登录 用手机扫码）")
+        logger.info("网易云登录态：还没有登录（发 /vs-login 用手机扫码）")
     roots = _scan_roots(engine)
     logger.info(
         "点歌发语音条已加载：触发词「{}」；音乐目录 {} 个{}；最多 {}MB；同会话冷却 {} 秒".format(

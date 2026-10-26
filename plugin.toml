@@ -1,7 +1,7 @@
 name = "netease-voice-song"
 repo = "gujin111/netease-voice-song"
 branch = "main"
-version = "1.9.1"
+version = "1.9.2"
 description = "点歌发语音条：群里说「点歌 歌名」，本地曲库优先，没有就去网易云下载完整歌曲，再以 QQ 语音条发出来"
 author = "DSH（NeoBot 移植）"
 dependencies = []

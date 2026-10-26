@@ -307,10 +307,10 @@ def _join_cookie(values: Dict[str, str]) -> str:
 
 
 def resolve_cookie(manual: str = "", allow_client: bool = False, saved: Optional[str] = None) -> Dict[str, str]:
-    """取登录态。优先级：设置里手填 → ``/点歌登录`` 扫码保存的 → 旧的本机客户端文件。
+    """取登录态。优先级：设置里手填 → ``/vs-login`` 扫码保存的 → 旧的本机客户端文件。
 
     ``allow_client`` 默认 **False**：本机客户端那条路是 1.7.0 的做法，现在改用
-    手机扫码登录（``/点歌登录``）。老用户想继续用客户端 cookie 可以把它打开。
+    手机扫码登录（``/vs-login``）。老用户想继续用客户端 cookie 可以把它打开。
 
     每次下载都重新调一次（重新登录后能立刻跟上）。
     返回 ``{"cookie": str, "source": str}`` 或 ``{"error": str}``。
@@ -325,7 +325,7 @@ def resolve_cookie(manual: str = "", allow_client: bool = False, saved: Optional
 
     if not allow_client:
         return {
-            "error": "还没有登录：发 /点歌登录 用手机扫码（或在设置里手填 cookie）"
+            "error": "还没有登录：发 /vs-login 用手机扫码（或在设置里手填 cookie）"
         }
     for path in cookie_file_candidates():
         try:
@@ -542,7 +542,7 @@ async def song_url(
         code = None
     if not data.get("url") or (code is not None and code != 200):
         if code == -110:
-            hint = "登录态无效或已过期（code=-110）—— 发 /点歌登录 用手机重新扫码即可"
+            hint = "登录态无效或已过期（code=-110）—— 发 /vs-login 用手机重新扫码即可"
         else:
             hint = "官方返回 code={}".format(code if code is not None else "未知")
         return {"ok": False, "code": code, "error": hint}

@@ -111,7 +111,7 @@ class VoiceSongConfig(BaseModel):
         default=180, ge=30, le=900,
         description=(
             "扫码登录二维码的有效期（秒，默认 180）。超时后二维码作废，"
-            "需要重新发 /点歌登录。"
+            "需要重新发 /vs-login。"
         ),
     )
     netease_min_interval_sec: float = Field(
@@ -125,7 +125,7 @@ class VoiceSongConfig(BaseModel):
         default=False,
         description=(
             "旧方式（默认关）：从本机已登录的网易云客户端读 cookie。"
-            "现在推荐用 /点歌登录 让手机扫码；只有在机器人就跑在你自己电脑上、"
+            "现在推荐用 /vs-login 让手机扫码；只有在机器人就跑在你自己电脑上、"
             "且不想扫码时才打开它。"
         ),
     )
