@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 插件运行期数据（正常不会出现在仓库里，防止误提交）
+data/
+plugins_data/
+logs/
+*.log
+
+# 本地测试产物
+.pytest_cache/
+htmlcov/
+.coverage
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
