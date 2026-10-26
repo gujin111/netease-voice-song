@@ -136,6 +136,17 @@ async def main() -> None:
         print("=" * 60)
         print(await module._render_library(module._engine, raw_args="周杰伦", is_admin=True))
         print()
+        print("=" * 60)
+        print("发 /vs-help（图片版，写成文件方便看）")
+        print("=" * 60)
+        png = module.help_image.render(module._help_blocks(module._engine, is_admin=True))
+        if png:
+            out = Path.cwd() / "vs-help-preview.png"
+            out.write_bytes(png)
+            print("已写到 {}（{} 字节）".format(out, len(png)))
+        else:
+            print("本机没有 Pillow / 中文字体，只有文字版")
+        print()
         await module.plugin.shutdown_handlers[0]()
 
 

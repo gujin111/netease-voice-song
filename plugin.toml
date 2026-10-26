@@ -1,10 +1,12 @@
 name = "netease-voice-song"
 repo = "gujin111/netease-voice-song"
 branch = "main"
-version = "1.9.3"
+version = "1.9.4"
 description = "点歌发语音条：群里说「点歌 歌名」，本地曲库优先，没有就去网易云下载完整歌曲，再以 QQ 语音条发出来"
 author = "DSH（NeoBot 移植）"
 dependencies = []
+# /vs-help 发图片需要 Pillow（面板安装时按这个列表装；装不上也不影响点歌，会自动退回文字）
+python_dependencies = ["pillow"]
 priority = 0
 min_neobot_version = "2.0.0"
 hot_reload = true
@@ -37,6 +39,8 @@ max_files = 4000
 fuzzy = true
 # 开 = 普通群友也能用 /vs-library 列曲库文件名；关（默认）= 只有管理员能看完整清单。
 library_public = false
+# 开（默认）= /vs-help 发一张排版好的图片；关 = 发文字（缺 Pillow 时也会自动退回文字）。
+help_image = true
 
 # ── 自动下载 ──
 # 开（默认）= 本地找不到时去网易云下载完整歌曲再发语音条；关 = 只发本地已有的歌。

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import io
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 try:  # 与 netease.py 同源：httpx 由本体提供
@@ -35,6 +36,7 @@ STATE_WAITING = "waiting"      # 801 等待扫码
 STATE_SCANNED = "scanned"      # 802 已扫码，等手机确认
 STATE_SUCCESS = "success"      # 803 授权成功
 STATE_EXPIRED = "expired"      # 800 二维码失效
+STATE_UNKNOWN = "unknown"      # 未文档化的状态码（例如 8821）：交给上层决定要不要继续等
 STATE_FAILED = "failed"        # 其它（网络/服务异常）
 
 #: 需要拿到这两个之一才算真的登录了
@@ -46,6 +48,12 @@ _POLL_CODE_STATE = {
     802: STATE_SCANNED,
     803: STATE_SUCCESS,
 }
+
+
+def _stamp(url: str) -> str:
+    """给接口 URL 加时间戳，防止中间层缓存住上一次的轮询结果。"""
+    separator = "&" if "?" in url else "?"
+    return "{}{}timestamp={}".format(url, separator, int(time.time() * 1000))
 
 _COOKIE_PAIR_RE = re.compile(r"^\s*([^=;\s]+)=([^;]*)")
 
@@ -96,7 +104,7 @@ def is_logged_in(cookies: Dict[str, str]) -> bool:
 async def request_unikey(*, timeout_sec: float = 12.0) -> Dict[str, Any]:
     """第 1 步：申请一个二维码 key。"""
     result = await netease.request_json(
-        "POST", UNIKEY_URL, data={"type": "1"}, timeout_sec=timeout_sec
+        "POST", _stamp(UNIKEY_URL), data={"type": "1"}, timeout_sec=timeout_sec
     )
     if result.get("error"):
         return {"ok": False, "error": result["error"], "rate_limited": bool(result.get("risk_limited"))}
@@ -123,11 +131,19 @@ async def poll_once(key: str, *, cookie: str = "", timeout_sec: float = 12.0) ->
 
     ``cookie`` 是流程里已经攒到的 cookie（unikey / 之前的轮询），带上它，
     后续轮询的响应才可能补齐 __csrf/NMTID。
-    返回 ``{"state": ..., "code": int, "cookies": {...}, "message": str}``。
+
+    ⚠️ **未知状态码不能直接判死**：800/801/802/803 是文档化的四个状态，
+       但线上还会出现别的码（例如 ``8821``）—— 那多半是账号触发了安全验证
+       （新设备 / 异地登录），用户在手机上完成验证后，轮询是会继续变成 803 的。
+       所以这里把未知码单独标成 ``STATE_UNKNOWN`` 并把网易云自己的 ``message``
+       原样带出去：由上层决定「再等几次」还是「告诉用户去验证」。
+       以前一律映射成 failed，于是手机刚弹出验证、这边就把二维码作废了。
+
+    返回 ``{"state": ..., "code": int, "cookies": {...}, "message": str, "raw": dict}``。
     """
     result = await netease.request_json(
         "POST",
-        POLL_URL,
+        _stamp(POLL_URL),
         data={"key": key, "type": "1"},
         cookie=cookie,
         timeout_sec=timeout_sec,
@@ -146,7 +162,10 @@ async def poll_once(key: str, *, cookie: str = "", timeout_sec: float = 12.0) ->
         code = int(payload.get("code"))
     except (TypeError, ValueError):
         code = -1
-    state = _POLL_CODE_STATE.get(code, STATE_FAILED)
+    # 网易云在响应里自带人话（「等待扫码」「二维码不存在或已过期」…）：
+    # 未知码必须把它原样带出去，否则用户只看到「code=8821」，谁也判断不了原因。
+    server_message = str(payload.get("message") or payload.get("msg") or "").strip()
+    state = _POLL_CODE_STATE.get(code, STATE_UNKNOWN)
     cookies = cookies_from_set_cookie(result.get("set_cookie"))
     if state == STATE_SUCCESS and not is_logged_in(cookies):
         return {
@@ -154,17 +173,23 @@ async def poll_once(key: str, *, cookie: str = "", timeout_sec: float = 12.0) ->
             "code": code,
             "cookies": cookies,
             "message": "扫码已确认，但没拿到登录 cookie（可能被风控或 cookie 被拦了）",
+            "raw": payload,
         }
     messages = {
         STATE_WAITING: "等待扫码",
         STATE_SCANNED: "已扫码，请在手机上点「确认登录」",
         STATE_SUCCESS: "登录成功",
         STATE_EXPIRED: "二维码已失效，请重新发起登录",
-        STATE_FAILED: "扫码状态异常（code={}）".format(code),
+        STATE_UNKNOWN: "网易云返回了未文档化的状态（code={}）".format(code),
     }
+    message = messages.get(state, "")
+    if state == STATE_UNKNOWN:
+        # 只带网易云自己的说明：状态码由调用方拼，避免同一句话里出现两遍 code
+        message = server_message or "（网易云没给说明）"
     return {
         "state": state,
         "code": code,
         "cookies": cookies,
-        "message": messages.get(state, ""),
+        "message": message,
+        "raw": payload,
     }

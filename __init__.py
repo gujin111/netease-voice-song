@@ -63,17 +63,18 @@ import re
 import secrets
 import shutil
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from neobot_modloader import Message, Plugin
 
-from . import download, library, logic, netease, netease_login, login_store
+from . import download, help_image, library, logic, netease, netease_login, login_store
 from .config import VoiceSongConfig
 
 PLUGIN_NAME = "netease-voice-song"
-PLUGIN_VERSION = "1.9.3"
+PLUGIN_VERSION = "1.9.4"
 
 #: 临时音频文件保留多久（协议端可能还在读，不能发完就删）
 TMP_KEEP_SEC = 15 * 60
@@ -149,6 +150,10 @@ _CMD_PAGE_SIZE = 20
 #: 扫码登录轮询间隔（秒）+ 抖动。官方客户端约 2 秒一次，这里慢一点更安全。
 _LOGIN_POLL_SEC = 3.0
 _LOGIN_POLL_JITTER_SEC = 0.8
+#: 连续收到「未文档化状态码」几次才判失败。
+#: 800/801/802/803 之外还会出现别的码（实测 8821），那多半是账号触发了安全验证：
+#: 用户在手机上完成验证后轮询会继续变成 803 —— 所以不能一见到未知码就把二维码作废。
+_LOGIN_UNKNOWN_LIMIT = 5
 
 try:  # 权限常量在 neobot_app.commands.model；取不到就按字面值 1（次级管理员）
     from neobot_app.commands.model import PERM_SUB_ADMIN as _PERM_SUB_ADMIN
@@ -1437,6 +1442,7 @@ async def _poll_login(engine: Engine, session: LoginSession) -> None:
        而且用户扫完会主动点确认，没必要抢那几百毫秒。
     """
     failures = 0
+    unknown = 0
     last_state = ""
     deadline = session.started_at + session.timeout_sec
     try:
@@ -1455,6 +1461,35 @@ async def _poll_login(engine: Engine, session: LoginSession) -> None:
             if state == netease_login.STATE_SCANNED and last_state != state:
                 await session.sender.text("👀 已扫码，请在手机上点「确认登录」…")
             last_state = state
+
+            if state == netease_login.STATE_UNKNOWN:
+                # 未知码（实测 8821）：多半是账号触发了安全验证（新设备 / 异地登录）。
+                # 继续等 —— 用户在手机上按提示完成验证后，轮询会接着变成 803。
+                # 只有连续多次都还是未知，才真正判失败，并把网易云自己的话原样带出来。
+                unknown += 1
+                _warn(
+                    engine,
+                    "{} 扫码轮询返回未文档化状态 code={} message={!r}（第 {} 次）".format(
+                        session.chat_key, result.get("code"), result.get("message"), unknown
+                    ),
+                )
+                if unknown < _LOGIN_UNKNOWN_LIMIT:
+                    continue
+                engine.login = None
+                await session.sender.text(
+                    "❌ 扫码登录没成功：网易云连续 {} 次返回未文档化的状态码 code={}。\n"
+                    "网易云的说法：{}\n"
+                    "这通常是账号触发了安全验证（新设备 / 异地登录）。可以：\n"
+                    "① 在手机上按提示完成验证，再发一次 /vs-login；\n"
+                    "② 或在「配置 → cookie_secret」里手填 MUSIC_U=...；\n"
+                    "③ 或打开 use_client_cookie，读本机网易云客户端的登录态。".format(
+                        unknown,
+                        result.get("code"),
+                        result.get("message") or "（网易云没给说明）",
+                    ),
+                )
+                return
+            unknown = 0
 
             if state == netease_login.STATE_SUCCESS:
                 cookies = dict(session.cookies) or (result.get("cookies") or {})
@@ -1751,48 +1786,122 @@ async def _render_library(engine: Engine, *, raw_args: str = "", is_admin: bool 
     return "\n".join(lines)[:_CMD_MAX_CHARS]
 
 
-def _render_help(engine: Engine, *, is_admin: bool) -> str:
-    """``/vs-help``：一屏看完这个插件的所有入口。
+def _help_blocks(engine: Engine, *, is_admin: bool) -> List[Dict[str, Any]]:
+    """``/vs-help`` 的结构化内容 —— 文字版与图片版**共用这一份**。
 
-    为什么单独做一条而不是让用户翻 /help：``/help`` 只列「注册进本体命令表」的命令，
-    而这里还要交代**不带斜杠的自然说法**（点歌 / 来一首 …）和**管理员指令**
-    （解除点歌限制）——这两类都不在命令表里，翻 /help 是看不到的。
+    为什么抽出来：以前文字是手写的字符串列表，如果图片再单独写一份，
+    迟早出现「图里写 /vs-login、文字里写 /点歌登录」这种漂移。
+    现在 `_help_text_from_blocks` 和 `help_image.render` 都从 blocks 生成。
     """
     cfg = engine.config
     triggers = " / ".join(cfg.trigger_list) or "（未配置）"
-    lines = [
-        "🎤 点歌发语音条 · 全部指令",
-        "",
-        "【点歌（放歌只用这一种，任何会话）】",
-        "  点歌 海阔天空 ｜ 来一首 海阔天空 ｜ 我想听 海阔天空",
-        "  · 触发词（必须出现在开头）：{}".format(triggers),
-        "  · 也可以带斜杠：/点歌 海阔天空",
-        "  · 出候选列表时，回数字（2 / 第2首）或歌手名即可",
-        "",
-        "【其它指令：英文 vs-* 命名空间（和歌名不会混）】",
-        "  /vs-help                这一屏说明（简写 /vs）",
-        "  /vs-status              登录态 + 曲库规模 + 限流与风控",
-        "  /vs-library [关键词] [页码]  曲库清单：筛选 / 翻页（每页 20 首，管理员）",
-        "  /vs-login [取消]        手机扫码登录网易云（管理员）",
-        "  /vs-logout              退出网易云登录（管理员）",
-        "",
-        "【管理员】",
-        "  解除点歌限制 [本群|我|QQ号] [10分钟]",
-        "  · 清掉冷却与配额；带时长 = 这段时间不再限制",
-        "",
-        "示例：/vs-library 周杰伦  →  /vs-library 2  →  /点歌 稻香",
-        "",
-        "为什么不用「/点歌登录」这种名字：它会和「点一首叫《登录》的歌」分不开。",
-        "旧的 /点歌帮助、/点歌状态、/点歌登录 仍可用（自动转成对应 /vs-*，不会再被当成歌名）。",
-        "",
-        "全程 0 token：点歌与指令都不经过模型",
+    blocks: List[Dict[str, Any]] = [
+        {"kind": "title", "text": "点歌发语音条 · 全部指令"},
+        {"kind": "sub", "text": "全程 0 token：点歌与指令都不经过模型"},
+        {"kind": "h2", "text": "点歌（放歌只用这一种，任何会话）"},
+        {"kind": "para", "text": "点歌 海阔天空 ｜ 来一首 海阔天空 ｜ 我想听 海阔天空"},
+        {"kind": "note", "text": "触发词（必须出现在开头）：{}".format(triggers)},
+        {"kind": "note", "text": "也可以带斜杠：/点歌 海阔天空"},
+        {"kind": "note", "text": "出候选列表时，回数字（2 / 第2首）或歌手名即可"},
+        {"kind": "h2", "text": "其它指令：英文 vs-* 命名空间（和歌名不会混）"},
+        {"kind": "cmd", "cmd": "/vs-help", "desc": "这一屏说明（简写 /vs）"},
+        {"kind": "cmd", "cmd": "/vs-status", "desc": "登录态 + 曲库规模 + 限流与风控"},
+        {
+            "kind": "cmd",
+            "cmd": "/vs-library [关键词] [页码]",
+            "desc": "曲库清单：筛选 / 翻页（每页 20 首，管理员）",
+        },
+        {"kind": "cmd", "cmd": "/vs-login [取消]", "desc": "手机扫码登录网易云（管理员）"},
+        {"kind": "cmd", "cmd": "/vs-logout", "desc": "退出网易云登录（管理员）"},
+        {"kind": "h2", "text": "管理员"},
+        {
+            "kind": "cmd",
+            "cmd": "解除点歌限制 [本群|我|QQ号] [10分钟]",
+            "desc": "清掉冷却与配额；带时长 = 这段时间不再限制",
+        },
+        {"kind": "note", "text": "示例：/vs-library 周杰伦  →  /vs-library 2  →  /点歌 稻香"},
+        {
+            "kind": "note",
+            "text": "为什么不用「/点歌登录」这种名字：它会和「点一首叫《登录》的歌」分不开。",
+        },
+        {
+            "kind": "note",
+            "text": "旧的 /点歌帮助、/点歌状态、/点歌登录 仍可用（自动转成对应 /vs-*，不会再被当成歌名）。",
+        },
     ]
     if not is_admin:
-        lines.append("（标了「管理员」的指令需要管理员身份；可让管理员在配置里把你加进 admin_qqs）")
+        blocks.append(
+            {
+                "kind": "note",
+                "text": "（标了「管理员」的指令需要管理员身份；可让管理员在配置里把你加进 admin_qqs）",
+            }
+        )
+    blocks.append({"kind": "footer", "text": "点歌本身没变：直接发「点歌 歌名」，或 /点歌 歌名。"})
+    return blocks
+
+
+def _display_width(text: str) -> int:
+    """终端/等宽场景下的显示宽度（中日韩全角按 2 算）。"""
+    total = 0
+    for char in str(text or ""):
+        total += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return total
+
+
+def _pad_columns(text: str, width: int) -> str:
+    return str(text or "") + " " * max(1, width - _display_width(text))
+
+
+def _help_text_from_blocks(blocks: List[Dict[str, Any]]) -> str:
+    """blocks → 纯文本（图片不可用时的降级形态）。"""
+    lines: List[str] = []
+    for block in blocks:
+        kind = str(block.get("kind") or "")
+        if kind == "title":
+            lines.append("🎤 " + str(block.get("text") or ""))
+        elif kind == "sub":
+            lines.append(str(block.get("text") or ""))
+        elif kind == "h2":
+            if lines:
+                lines.append("")
+            lines.append("【{}】".format(block.get("text") or ""))
+        elif kind == "para":
+            lines.append("  " + str(block.get("text") or ""))
+        elif kind == "cmd":
+            # 按显示宽度补空格：中文命令名是全角，直接 {:<34} 会对不齐
+            lines.append(
+                "  " + _pad_columns(str(block.get("cmd") or ""), 38) + str(block.get("desc") or "")
+            )
+        elif kind == "note":
+            lines.append("  · {}".format(block.get("text") or ""))
+        elif kind == "footer":
+            lines.append("")
+            lines.append(str(block.get("text") or ""))
     return "\n".join(lines)[:_CMD_MAX_CHARS]
 
 
-async def _command_help(command_ctx: Any) -> str:
+def _render_help(engine: Engine, *, is_admin: bool) -> str:
+    """``/vs-help`` 的纯文本形态。"""
+    return _help_text_from_blocks(_help_blocks(engine, is_admin=is_admin))
+
+
+async def _send_help(engine: Engine, reply: Any, *, is_admin: bool) -> bool:
+    """发帮助：优先图片，不可用/发不出去就退回文字。返回是否已经交付。"""
+    png: Optional[bytes] = None
+    if bool(getattr(engine.config, "help_image", True)):
+        # 渲染是 CPU + 字体 IO，别占事件循环
+        png = await asyncio.to_thread(help_image.render, _help_blocks(engine, is_admin=is_admin))
+    if png:
+        try:
+            if await reply.image(png, "vs-help.png"):
+                return True
+        except Exception as exc:  # 图片发不出去不该让「帮助」失败
+            _warn(engine, "帮助图片发送失败（改发文字）：{}".format(exc))
+    await reply.text(_render_help(engine, is_admin=is_admin))
+    return True
+
+
+async def _command_help(command_ctx: Any) -> Optional[str]:
     """``/vs-help``（命令管线路径）。
 
     ⚠️ 必须是 async：宿主是 ``await handler(...)`` 调命令处理器的，同步函数会直接抛
@@ -1803,7 +1912,9 @@ async def _command_help(command_ctx: Any) -> str:
     if engine is None:
         return "点歌插件还没准备好，稍后再试。"
     user_id = str(getattr(command_ctx, "user_id", "") or "")
-    return _render_help(engine, is_admin=_is_admin(engine, user_id))
+    # 图片由我们自己发（返回 None，宿主就不会再发一遍文字）
+    await _send_help(engine, _command_sender(command_ctx), is_admin=_is_admin(engine, user_id))
+    return None
 
 
 def _command_base_name(name: str) -> str:
@@ -1847,7 +1958,13 @@ async def _run_command(
             engine, raw_args=raw_args, is_admin=_is_admin(engine, sender_id)
         )
     elif base in (COMMAND_HELP, *COMMAND_HELP_ALIASES):
-        text = _render_help(engine, is_admin=_is_admin(engine, sender_id))
+        # 帮助走图片（发不出去/缺 Pillow 时 _send_help 自己退回文字）
+        await _send_help(
+            engine,
+            _hook_sender(engine, ctx, conversation),
+            is_admin=_is_admin(engine, sender_id),
+        )
+        return
     elif base in (COMMAND_LOGIN, *COMMAND_LOGIN_ALIASES):
         if not _is_admin(engine, sender_id):
             await _reply_quiet(

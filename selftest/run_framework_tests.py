@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import io
 import re
 import sys
 import tempfile
@@ -154,8 +155,10 @@ class FakeCtx:
         self.app_commands = FakeRegistrar()
         self.sent = []       # [(conversation, payload)]
         self.audio = []      # [(conversation, path)]
+        self.images = []     # [(conversation, bytes, filename)]
         self.audio_fails = 0
         self.send_fails = 0
+        self.image_fails = 0
 
     def conversation_from_event(self, event):
         if event.get("message_type") == "private" or not event.get("group_id"):
@@ -167,6 +170,12 @@ class FakeCtx:
             raise RuntimeError("模拟发送失败")
 
         self.sent.append((conversation, message))
+
+    async def send_image(self, conversation, *, data=None, filename=None, **kwargs):
+        if self.send_fails or self.image_fails:
+            raise RuntimeError("模拟发送图片失败")
+        self.images.append((conversation, data, filename))
+        return True
 
     async def send_audio(self, conversation, *, path):
         if self.audio_fails:
@@ -220,7 +229,7 @@ async def main():
     print("· 插件注册")
     plugin = module.plugin
     eq(plugin.name, "netease-voice-song", "插件名")
-    eq(plugin.version, "1.9.3", "版本")
+    eq(plugin.version, "1.9.4", "版本")
     eq(plugin.min_neobot_version, "2.0.0", "最低本体版本")
     rules = [item for item in plugin.messages if item.get("rule") is not None]
     eq(len(rules), 1, "一条带 rule 的消息注册")
@@ -611,6 +620,30 @@ async def main():
         check("登录：" in guest_text, "普通群友仍能看到登录态是否可用", guest_text)
         module._engine.config = config
 
+        # 命令管线里的 /vs-help：自己发图，返回 None（否则宿主会再发一遍文字）
+        class HelpService:
+            def __init__(self):
+                self.texts = []
+                self.images = 0
+
+            async def reply_to(self, kind, conv_id, text, *, at_user_id=None):
+                self.texts.append(text)
+
+            async def send_image_bytes(self, kind, conv_id, data, *, at_user_id=None, filename=None):
+                self.images += 1
+                return True
+
+        help_cmd = Cmd(user_id=456)
+        help_cmd.service = HelpService()
+        help_cmd.kind = "group"
+        help_cmd.conv_id = "123"
+        help_out = await module._command_help(help_cmd)
+        eq(help_out, None, "命令路径的帮助自己交付，返回 None")
+        if module.help_image.available():
+            check(help_cmd.service.images >= 1, "命令路径发的是图片", help_cmd.service.images)
+        else:
+            check(bool(help_cmd.service.texts), "没有 Pillow 时退回文字", help_cmd.service.texts[:1])
+
         print("· 指令：曲库 列表 / 筛选 / 翻页")
         # 普通群友：只看得到数量，看不到文件名（文件名可能带歌手 / 私人录音名）
         guest_lib = await module._command_library(Cmd(""))
@@ -684,11 +717,50 @@ async def main():
 
         no_at_help = text_event("/vs-help", user_id=456, message_id=607)
         eq(module._message_rule(no_at_help), True, "群里没 @ 时帮助指令也兜住")
+        # /vs-help 默认发图片；这里先把开关关掉，验证「文字降级」这条路径还在
+        module._engine.config = with_config(config, help_image=False)
         sent_before = len(ctx.sent)
+        images_before = len(ctx.images)
         await module._on_message(no_at_help, ctx, config)
         await drain(module)
         new_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
-        check(any("全部指令" in line for line in new_text), "兜底路径回了帮助正文", new_text)
+        check(any("全部指令" in line for line in new_text), "关掉图片时兜底返回帮助正文", new_text)
+        eq(len(ctx.images), images_before, "关掉图片时没有发图")
+        module._engine.config = config
+
+        print("· 指令：/vs-help 发图片（文字改成图片）")
+        if module.help_image.available():
+            png = module.help_image.render(module._help_blocks(module._engine, is_admin=False))
+            check(bool(png) and png[:8] == b"\x89PNG\r\n\x1a\n", "渲染出的是 PNG", (len(png) if png else 0,))
+            with module.help_image.Image.open(io.BytesIO(png)) as image:
+                width, height = image.size
+            check(width >= 1000 and height >= 600, "图不是空白小图", (width, height))
+
+            help_event = text_event("/vs-help", user_id=456, message_id=660)
+            sent_before = len(ctx.sent)
+            images_before = len(ctx.images)
+            await module._on_message(help_event, ctx, config)
+            await drain(module)
+            eq(len(ctx.images), images_before + 1, "发了一张帮助图片")
+            eq(len(ctx.sent), sent_before, "图片模式下不再重复发文字")
+            if ctx.images:
+                conversation, data, filename = ctx.images[-1]
+                eq(filename, "vs-help.png", "图片文件名")
+                eq(data[:8], b"\x89PNG\r\n\x1a\n", "发出去的是 PNG 字节")
+
+            # 图片发不出去（协议端不支持图片等）→ 自动退回文字
+            sent_before = len(ctx.sent)
+            ctx.image_fails = 1
+            try:
+                await module._on_message(text_event("/vs-help", user_id=456, message_id=661), ctx, config)
+                await drain(module)
+            finally:
+                ctx.image_fails = 0
+            fallback = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
+            check(any("全部指令" in line for line in fallback), "发图失败时退回文字", fallback)
+        else:
+            print("  （本机没有 Pillow / 中文字体，跳过图片用例）")
+
 
         # 群里 @了机器人 → 让给命令管线（否则会出现两条回复）
         mentioned = {
@@ -779,6 +851,12 @@ async def main():
             poll_response = {"json": {"code": 803}, "set_cookie": []}
             eq((await login.poll_once("KEY-1"))["state"], "failed",
                "803 但没 cookie 要判失败（不能谎报成功）")
+            # 未文档化的状态码（线上实测 8821）：单独标 unknown，并保留网易云自己的说明
+            poll_response = {"json": {"code": 8821, "message": "需要安全验证"}}
+            unknown = await login.poll_once("KEY-1")
+            eq(unknown["state"], "unknown", "8821 映射成 unknown 而不是 failed")
+            eq(unknown["code"], 8821, "code 原样带出")
+            check("需要安全验证" in (unknown.get("message") or ""), "保留网易云的说明", unknown)
         finally:
             module.netease.request_json = real_request
 
@@ -852,6 +930,74 @@ async def main():
             login.request_unikey = real_unikey
             login.poll_once = real_poll
             login.make_qr_png = real_png
+
+        print("· 扫码登录：8821 这类未知码先继续等，别把二维码作废")
+        real_unikey2 = login.request_unikey
+        real_poll2 = login.poll_once
+        calls = []
+
+        async def fake_unikey_safe(*, timeout_sec=12.0):
+            return {"ok": True, "key": "KEY-9", "url": "https://music.163.com/login?codekey=KEY-9"}
+
+        async def fake_poll_unknown_then_ok(key, *, cookie="", timeout_sec=12.0):
+            calls.append(1)
+            if len(calls) < 3:
+                return {"state": "unknown", "code": 8821, "cookies": {}, "message": "需要安全验证"}
+            return {
+                "state": "success",
+                "code": 803,
+                "cookies": {"MUSIC_U": "after-verify"},
+                "message": "登录成功",
+            }
+
+        login.request_unikey = fake_unikey_safe
+        login.poll_once = fake_poll_unknown_then_ok
+        try:
+            store.clear(module._engine.data_dir)
+            sent_lines.clear()
+            await module._start_login(
+                module._engine, sender, requester="123456", chat_key="group:123"
+            )
+            await drain(module)
+            eq(len(calls), 3, "8821 之后继续轮询（没有立刻判死）")
+            check(any("登录成功" in line for line in sent_lines), "完成验证后照样成功", sent_lines)
+            eq(store.describe()["logged_in"], True, "验证后登录态保存了")
+        finally:
+            login.request_unikey = real_unikey2
+            login.poll_once = real_poll2
+
+        print("· 扫码登录：连续未知才失败，且给出可操作建议")
+        real_unikey3 = login.request_unikey
+        real_poll3 = login.poll_once
+        always = []
+
+        async def fake_unikey_safe2(*, timeout_sec=12.0):
+            return {"ok": True, "key": "KEY-10", "url": "https://music.163.com/login?codekey=KEY-10"}
+
+        async def fake_poll_always_unknown(key, *, cookie="", timeout_sec=12.0):
+            always.append(1)
+            return {"state": "unknown", "code": 8821, "cookies": {}, "message": "需要安全验证"}
+
+        login.request_unikey = fake_unikey_safe2
+        login.poll_once = fake_poll_always_unknown
+        try:
+            store.clear(module._engine.data_dir)
+            sent_lines.clear()
+            await module._start_login(
+                module._engine, sender, requester="123456", chat_key="group:123"
+            )
+            await drain(module)
+            eq(len(always), module._LOGIN_UNKNOWN_LIMIT, "连续 5 次才判失败")
+            fail_lines = [line for line in sent_lines if "8821" in line]
+            check(bool(fail_lines), "失败信息里带上了真实 code", sent_lines)
+            check(
+                any("安全验证" in line and "cookie_secret" in line for line in sent_lines),
+                "给了可操作的建议（验证 / 手填 cookie）",
+                sent_lines,
+            )
+        finally:
+            login.request_unikey = real_unikey3
+            login.poll_once = real_poll3
 
         print("· 扫码登录：权限与登出")
         class CmdCtx:
@@ -929,6 +1075,9 @@ async def main():
             _inspect.iscoroutinefunction(module._command_help),
             "命令处理器是协程函数（宿主是 await 调用，同步函数会报 can't be used in 'await'）",
         )
+        # /点歌帮助 现在会发图片；这一组用例关心的是「旧名字有没有执行对应指令」，
+        # 所以先把图片关掉，用文字断言（图片路径另有专门用例）。
+        module._engine.config = with_config(config, help_image=False)
         for legacy_name, expect in (
             ("点歌帮助", "全部指令"),
             ("点歌状态", "点歌发语音条"),
@@ -944,6 +1093,7 @@ async def main():
             check(any("改名为" in line for line in new_text), "旧名给了改名说明", new_text)
             check(any(expect in line for line in new_text), "旧名真的执行了对应指令", new_text)
             eq(len(ctx.audio), audio_before, "旧名没有被当成点歌放歌")
+        module._engine.config = config
 
         # 旧名 /点歌登录 也不能绕过管理员校验（这是安全边界，不是文案问题）
         sent_before = len(ctx.sent)

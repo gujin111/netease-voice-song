@@ -80,6 +80,13 @@ class VoiceSongConfig(BaseModel):
             "关（默认）= 只有管理员能看完整清单（文件名可能带私人信息），普通群友只看到数量。"
         ),
     )
+    help_image: bool = Field(
+        default=True,
+        description=(
+            "开（默认）= /vs-help 发一张排版好的图片；关 = 发文字。"
+            "图片需要 Pillow，缺 Pillow 时会自动退回文字。"
+        ),
+    )
 
     # ── 自动下载 ──
     enable_download: bool = Field(
