@@ -128,11 +128,30 @@ class FakeHost:
         self.services = services
 
 
+class FakeRegistrar:
+    """按 PluginCommandRegistrar 的形状记录注册（register 既可直接调用也可当装饰器）。"""
+
+    available = True
+
+    def __init__(self):
+        self.commands = {}
+
+    def register(self, command=None, *, prefixed=False, **options):
+        name = command if isinstance(command, str) else str(options.get("name") or "")
+
+        def decorate(handler):
+            self.commands[name] = dict(options, name=name, handler=handler, prefixed=prefixed)
+            return handler
+
+        return decorate
+
+
 class FakeCtx:
     def __init__(self, data_dir, logger, admins=()):
         self.data_dir = Path(data_dir)
         self.logger = logger
         self.plugin_host = FakeHost(FakeServices({"command_service": FakeCommandService(admins)}))
+        self.app_commands = FakeRegistrar()
         self.sent = []       # [(conversation, payload)]
         self.audio = []      # [(conversation, path)]
         self.audio_fails = 0
@@ -156,11 +175,14 @@ class FakeCtx:
 
 
 def text_event(text, *, user_id=456, group_id=123, message_id=1, private=False):
+    # 真实 OneBot 事件一定带 self_id（机器人自己的 QQ）；带不带它会影响
+    # 「群里没 @ 机器人时该不该由插件兜住指令」这条判定，所以测试也照实给。
     event = {
         "post_type": "message",
         "message_type": "private" if private else "group",
         "user_id": user_id,
         "message_id": message_id,
+        "self_id": 10000,
         "message": [{"type": "text", "data": {"text": text}}],
     }
     if not private:
@@ -198,7 +220,7 @@ async def main():
     print("· 插件注册")
     plugin = module.plugin
     eq(plugin.name, "netease-voice-song", "插件名")
-    eq(plugin.version, "1.7.0", "版本")
+    eq(plugin.version, "1.9.0", "版本")
     eq(plugin.min_neobot_version, "2.0.0", "最低本体版本")
     rules = [item for item in plugin.messages if item.get("rule") is not None]
     eq(len(rules), 1, "一条带 rule 的消息注册")
@@ -543,6 +565,298 @@ async def main():
         if ctx.audio:
             eq(ctx.audio[-1][0].kind, "private", "发到私聊会话")
             eq(ctx.audio[-1][0].id, "789", "会话 id 是对方 QQ")
+
+        print("· 指令：注册")
+        registrar = module._engine.ctx.app_commands
+        names = set(registrar.commands)
+        check(names >= {"点歌状态", "点歌乐库", "点歌登录", "点歌登出"}, "四个指令都注册了", names)
+        status_cmd = registrar.commands["点歌状态"]
+        library_cmd = registrar.commands["点歌乐库"]
+        check("点歌登录" not in (status_cmd.get("aliases") or ()), "点歌登录 不再是状态指令的别名", status_cmd.get("aliases"))
+        check("点歌列表" in (library_cmd.get("aliases") or ()), "乐库指令有别名 /点歌列表", library_cmd.get("aliases"))
+        check("点歌扫码" in (registrar.commands["点歌登录"].get("aliases") or ()), "登录指令有别名", registrar.commands["点歌登录"].get("aliases"))
+        check(bool(status_cmd.get("description")), "状态指令有说明（/help 会显示）")
+        check("关键词" in (library_cmd.get("usage") or ""), "乐库指令写了用法", library_cmd.get("usage"))
+
+        print("· 指令：状态 与 登录态")
+        class Cmd:
+            def __init__(self, raw_args="", user_id=456):
+                self.raw_args = raw_args
+                self.user_id = user_id
+
+        # 关掉自动下载时不该去读 cookie，输出稳定
+        plain_cfg = with_config(config, enable_download=False)
+        module._engine.config = plain_cfg
+        status_text = await module._command_status(Cmd(user_id=456))
+        check("点歌发语音条" in status_text, "状态标题", status_text[:60])
+        check("曲库：1 首" in status_text, "状态里有曲库数量", status_text)
+        check("未启用自动下载" in status_text, "关下载时说明清楚", status_text)
+        check("限流：" in status_text, "状态里有防刷屏配置", status_text)
+
+        # 管理员才看得到路径/下载目录
+        module._engine.config = with_config(config, enable_download=True, admin_qqs="123456")
+        admin_text = await module._command_status(Cmd(user_id=123456))
+        check("下载目录：" in admin_text, "管理员看得到下载目录", admin_text)
+        guest_text = await module._command_status(Cmd(user_id=456))
+        check("下载目录：" not in guest_text, "普通群友看不到路径", guest_text)
+        check("登录：" in guest_text, "普通群友仍能看到登录态是否可用", guest_text)
+        module._engine.config = config
+
+        print("· 指令：曲库 列表 / 筛选 / 翻页")
+        library_text = await module._command_library(Cmd(""))
+        check("曲库 1 首" in library_text, "列表显示总数", library_text)
+        check("1. 海阔天空" in library_text, "列表里有那首歌", library_text)
+        check("/点歌乐库" in library_text, "给了翻页/筛选提示", library_text)
+        hit_text = await module._command_library(Cmd("海阔"))
+        check("筛选「海阔」命中 1 首" in hit_text, "关键词筛选", hit_text)
+        miss_text = await module._command_library(Cmd("不存在的歌"))
+        check("没有文件名含" in miss_text, "没命中时说清楚", miss_text)
+        page_text = await module._command_library(Cmd("第9页"))
+        check("1. 海阔天空" in page_text, "越界页码回到最后一页（仍能列出内容）", page_text)
+        check("第 1/1 页" not in page_text, "只有一页时不显示页码行", page_text)
+
+        print("· 指令不会被子点歌钩子吃掉")
+        # 群里没 @机器人 → 插件自己回
+        no_at = text_event("/点歌状态", user_id=456, message_id=601)
+        eq(module._message_rule(no_at), True, "群里没 @ 时由插件兜住指令")
+        audio_before = len(ctx.audio)
+        sent_before = len(ctx.sent)
+        await module._on_message(no_at, ctx, config)
+        await drain(module)
+        new_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
+        check(any("点歌发语音条" in line for line in new_text), "兜底路径真的回了状态", new_text)
+        eq(len(ctx.audio), audio_before, "指令没被当成点歌放歌")
+
+        no_at_lib = text_event("/点歌乐库", user_id=456, message_id=602)
+        eq(module._message_rule(no_at_lib), True, "乐库指令同样兜住")
+        sent_before = len(ctx.sent)
+        await module._on_message(no_at_lib, ctx, config)
+        await drain(module)
+        new_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
+        check(any("曲库 1 首" in line for line in new_text), "乐库兜底输出", new_text)
+
+        # 群里 @了机器人 → 让给命令管线（否则会出现两条回复）
+        mentioned = {
+            "post_type": "message",
+            "message_type": "group",
+            "group_id": 123,
+            "user_id": 456,
+            "message_id": 603,
+            "self_id": 10000,
+            "message": [
+                {"type": "at", "data": {"qq": "10000"}},
+                {"type": "text", "data": {"text": " /点歌状态"}},
+            ],
+        }
+        eq(module._message_rule(mentioned), False, "@了机器人时应让给命令管线")
+        # 私聊不需要 @ → 也让给命令管线
+        eq(module._message_rule(text_event("/点歌状态", private=True, message_id=604)), False, "私聊让给命令管线")
+        # 别的 / 命令：不接管
+        eq(module._message_rule(text_event("/help", message_id=605)), False, "别人的指令不接管")
+        # 斜杠点歌仍然照常（它不属于本插件注册的指令）
+        slash_song = text_event("/点歌 海阔天空", message_id=606)
+        eq(module._message_rule(slash_song), True, "/点歌 歌名 仍走点歌钩子")
+        module._engine.gate.reset("group:123", "456", "all")
+        before_audio = len(ctx.audio)
+        await module._on_message(slash_song, ctx, config)
+        await drain(module)
+        eq(len(ctx.audio), before_audio + 1, "斜杠点歌真的发了语音条")
+
+        print("· 扫码登录：登录态存储")
+        store = module.login_store
+        login_dir = temp / "login"
+        eq(store.bootstrap(login_dir), None, "没保存过时 bootstrap 为 None")
+        eq(store.describe()["logged_in"], False, "初始未登录")
+        eq(store.save(login_dir, {"MUSIC_U": "abc123", "__csrf": "csrf9"}, source="qr"), True, "保存成功")
+        eq((login_dir / store.LOGIN_FILENAME).is_file(), True, "登录文件落地")
+        eq(store.load(login_dir)["cookies"]["MUSIC_U"], "abc123", "读回 cookie")
+        eq(store.describe()["logged_in"], True, "describe 认已登录")
+        check("abc123" not in str(store.describe()), "describe 不回显 cookie 值")
+        eq(store.cookie_string({"A": "1", "B": "2"}), "A=1; B=2", "拼 cookie")
+        check(store.age_text(0) == "", "没有时间时不给文案")
+        # age_text 用的是墙上时间（time.time），别拿单调时钟去喂它\n        check("分钟前" in store.age_text(store.time.time() - 120), "相对时间")
+        store.clear(login_dir)
+        eq(store.describe()["logged_in"], False, "登出后清空")
+
+        print("· 扫码登录：Set-Cookie 解析与状态机")
+        login = module.netease_login
+        parsed = login.cookies_from_set_cookie(
+            [
+                "MUSIC_U=xyz123; Path=/; Domain=.music.163.com; HttpOnly",
+                "__csrf=abc; Path=/",
+                "NMTID=zzz",
+                "bogus",
+            ]
+        )
+        eq(parsed.get("MUSIC_U"), "xyz123", "取到 MUSIC_U")
+        eq(parsed.get("__csrf"), "abc", "取到 __csrf（完整 cookie 更不像脚本）")
+        eq(parsed.get("NMTID"), "zzz", "取到 NMTID")
+        eq(login.is_logged_in(parsed), True, "判定已登录")
+        eq(login.is_logged_in({"__csrf": "x"}), False, "只有 csrf 不算登录")
+        eq(login.make_qr_png("https://music.163.com/login?codekey=x") is None, True,
+           "本机没装 qrcode 时优雅降级（不抛异常）")
+
+        # 把网络层换成假的：只测状态机，不联网
+        real_request = module.netease.request_json
+        poll_response = {"json": {"code": 801}}
+        unikey_response = {"json": {"code": 200, "unikey": "KEY-1"}}
+
+        async def fake_request(method, url, *, data=None, cookie="", timeout_sec=12.0):
+            if "unikey" in url:
+                return dict(unikey_response)
+            if "client/login" in url:
+                return dict(poll_response)
+            return {"error": "unexpected url {}".format(url)}
+
+        module.netease.request_json = fake_request
+        try:
+            got = await login.request_unikey()
+            eq(got["ok"], True, "拿到 unikey")
+            eq(got["url"], "https://music.163.com/login?codekey=KEY-1", "二维码内容")
+            eq((await login.poll_once("KEY-1"))["state"], "waiting", "801 = 等待扫码")
+            poll_response = {"json": {"code": 802}}
+            eq((await login.poll_once("KEY-1"))["state"], "scanned", "802 = 已扫码待确认")
+            poll_response = {"json": {"code": 800}}
+            eq((await login.poll_once("KEY-1"))["state"], "expired", "800 = 二维码失效")
+            poll_response = {"json": {"code": 803}, "set_cookie": ["MUSIC_U=fromqr; Path=/"]}
+            ok_poll = await login.poll_once("KEY-1")
+            eq(ok_poll["state"], "success", "803 = 成功")
+            eq(ok_poll["cookies"]["MUSIC_U"], "fromqr", "成功时带回 cookie")
+            poll_response = {"json": {"code": 803}, "set_cookie": []}
+            eq((await login.poll_once("KEY-1"))["state"], "failed",
+               "803 但没 cookie 要判失败（不能谎报成功）")
+        finally:
+            module.netease.request_json = real_request
+
+        print("· 扫码登录：发起 → 扫码 → 保存 → 状态可见")
+        module._LOGIN_POLL_SEC = 0
+        module._LOGIN_POLL_JITTER_SEC = 0
+        sent_lines = []
+        images = []
+
+        async def capture_text(value):
+            sent_lines.append(value)
+
+        async def capture_image(data, filename):
+            images.append((len(data), filename))
+            return True
+
+        sender = module._Reply(capture_text, capture_image)
+        real_unikey = login.request_unikey
+        real_poll = login.poll_once
+        real_png = login.make_qr_png
+        real_save = store.save
+        real_clear = store.clear
+
+        async def fake_unikey(*, timeout_sec=12.0):
+            return {
+                "ok": True,
+                "key": "KEY-2",
+                "url": "https://music.163.com/login?codekey=KEY-2",
+            }
+
+        async def fake_poll_once(key, *, timeout_sec=12.0):
+            return {
+                "state": "success",
+                "code": 803,
+                "cookies": {"MUSIC_U": "qr-ok", "__csrf": "c1"},
+                "message": "登录成功",
+            }
+
+        login.request_unikey = fake_unikey
+        login.poll_once = fake_poll_once
+        login.make_qr_png = lambda url, **kw: b"\x89PNG-fake"
+        store.save = real_save  # 真存，验证落盘
+        try:
+            module._engine.config = with_config(config, admin_qqs="123456")
+            await module._start_login(
+                module._engine, sender, requester="123456", chat_key="group:123"
+            )
+            await drain(module)
+            check(any("二维码" in line or "扫码" in line for line in sent_lines), "发了扫码提示", sent_lines)
+            eq(len(images), 1, "发了一张二维码图片")
+            check(any("登录成功" in line for line in sent_lines), "成功后回了结果", sent_lines)
+            eq(store.describe()["logged_in"], True, "登录态已进内存")
+            eq((module._engine.data_dir / store.LOGIN_FILENAME).is_file(), True, "登录态已落盘")
+
+            # 登录后：cookie 解析优先级 手填 > 扫码保存 > 客户端文件
+            resolved = module.netease.resolve_cookie("", allow_client=False)
+            check("扫码" in resolved.get("source", ""), "默认用扫码保存的 cookie", resolved)
+            manual = module.netease.resolve_cookie("MUSIC_U=manual1", allow_client=False)
+            eq(manual["source"], "设置里手填", "手填优先")
+
+            # 状态里能看到已登录（登录态那几行只在开启自动下载时显示）
+            module._engine.config = with_config(config, enable_download=True, admin_qqs="123456")
+            status_after = await module._render_status(module._engine, is_admin=True)
+            check("已登录" in status_after and "扫码登录" in status_after, "状态显示已登录", status_after)
+        finally:
+            login.request_unikey = real_unikey
+            login.poll_once = real_poll
+            login.make_qr_png = real_png
+
+        print("· 扫码登录：权限与登出")
+        class CmdCtx:
+            def __init__(self, user_id, raw_args="", conv_id="123", kind="group"):
+                self.user_id = user_id
+                self.raw_args = raw_args
+                self.conv_id = conv_id
+                self.kind = kind
+                self.service = FakeCmdService()
+
+        class FakeCmdService:
+            def __init__(self):
+                self.texts = []
+                self.images = 0
+
+            async def reply_to(self, kind, conv_id, text, *, at_user_id):
+                self.texts.append(text)
+
+            async def send_image_bytes(self, kind, conv_id, data, *, at_user_id=None, filename=None):
+                self.images += 1
+                return True
+
+        guest = await module._command_login(CmdCtx(456))
+        check("管理员" in str(guest), "非管理员不能发起扫码登录", guest)
+
+        admin_ctx = CmdCtx(123456)
+        real_unikey2 = login.request_unikey
+        real_poll2 = login.poll_once
+        real_png2 = login.make_qr_png
+        login.request_unikey = fake_unikey
+        login.poll_once = fake_poll_once
+        login.make_qr_png = lambda url, **kw: b"\x89PNG-fake"
+        try:
+            out = await module._command_login(admin_ctx)
+            eq(out, None, "命令路径自己发过消息，返回 None")
+            await drain(module)
+            check(any("扫码" in line or "二维码" in line for line in admin_ctx.service.texts),
+                  "命令路径发了二维码说明", admin_ctx.service.texts)
+            eq(admin_ctx.service.images, 1, "命令路径发了二维码图片")
+            eq(store.describe()["logged_in"], True, "命令路径也把登录态存下了")
+        finally:
+            login.request_unikey = real_unikey2
+            login.poll_once = real_poll2
+            login.make_qr_png = real_png2
+
+        # 取消
+        out = await module._command_login(CmdCtx(123456, raw_args="取消"))
+        check("取消" in str(out), "「取消」能中断", out)
+
+        # 登出
+        out = await module._command_logout(CmdCtx(456))
+        check("管理员" in str(out), "非管理员不能登出", out)
+        out = await module._command_logout(CmdCtx(123456))
+        check("已退出" in str(out), "管理员可以登出", out)
+        eq(store.describe()["logged_in"], False, "登出后内存清空")
+        eq((module._engine.data_dir / store.LOGIN_FILENAME).is_file(), False, "登出后文件删除")
+
+        print("· 风控节流参数")
+        module.netease.set_min_interval(3.0)
+        eq(module.netease.risk_status()["min_interval_sec"], 3.0, "节流间隔可配置")
+        module.netease.set_min_interval(0.1)
+        eq(module.netease.risk_status()["min_interval_sec"], 0.5, "过小的间隔被夹到 0.5")
+        module.netease.set_min_interval(1.5)
+        eq(module.netease.risk_status()["risk_cooldown_left"], 0, "初始没有风控冷却")
 
         print("· 关闭开关后完全放手")
         module._engine.config = with_config(config, enabled=False)

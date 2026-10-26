@@ -58,6 +58,8 @@ from __future__ import annotations
 
 import asyncio
 import math
+import random
+import re
 import secrets
 import shutil
 import time
@@ -67,11 +69,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from neobot_modloader import Message, Plugin
 
-from . import download, library, logic, netease
+from . import download, library, logic, netease, netease_login, login_store
 from .config import VoiceSongConfig
 
 PLUGIN_NAME = "netease-voice-song"
-PLUGIN_VERSION = "1.7.0"
+PLUGIN_VERSION = "1.9.0"
 
 #: 临时音频文件保留多久（协议端可能还在读，不能发完就删）
 TMP_KEEP_SEC = 15 * 60
@@ -85,6 +87,41 @@ SCAN_TIME_BUDGET_MS = 2500
 TOOL_TARGET_TTL_SEC = 300
 #: 「这一轮已经放过歌」的判定窗口（工具路径用）
 TURN_PLAY_TTL_SEC = 600
+
+# ── QQ 指令 ──
+#: 状态 / 登录态
+COMMAND_STATUS = "点歌状态"
+COMMAND_STATUS_ALIASES = ("点歌状态查询",)
+#: 曲库
+COMMAND_LIBRARY = "点歌乐库"
+COMMAND_LIBRARY_ALIASES = ("点歌列表", "点歌曲库")
+#: 扫码登录 / 退出登录（1.9.0 起取代「读本机客户端 cookie」）
+COMMAND_LOGIN = "点歌登录"
+COMMAND_LOGIN_ALIASES = ("点歌扫码", "网易云登录")
+COMMAND_LOGOUT = "点歌登出"
+COMMAND_LOGOUT_ALIASES = ("网易云登出", "点歌退出登录")
+
+#: 本插件独占的指令名（含别名）。为什么要这份清单：插件的消息钩子在宿主命令管线
+#: **之前**执行，不先让开的话「/点歌状态」会被当成点歌《状态》——所以凡是这些名字
+#: 开头的 "/" 消息，一律先交给命令管线（见 _is_own_command / _command_will_handle）。
+_OWN_COMMANDS = {
+    COMMAND_STATUS,
+    COMMAND_LIBRARY,
+    COMMAND_LOGIN,
+    COMMAND_LOGOUT,
+    *COMMAND_STATUS_ALIASES,
+    *COMMAND_LIBRARY_ALIASES,
+    *COMMAND_LOGIN_ALIASES,
+    *COMMAND_LOGOUT_ALIASES,
+}
+_COMMAND_HEAD_RE = re.compile(r"^\s*/(\S+)")
+#: 指令输出上限（QQ 单条文本别太长）
+_CMD_MAX_CHARS = 1500
+#: 曲库列表每页条数
+_CMD_PAGE_SIZE = 20
+#: 扫码登录轮询间隔（秒）+ 抖动。官方客户端约 2 秒一次，这里慢一点更安全。
+_LOGIN_POLL_SEC = 3.0
+_LOGIN_POLL_JITTER_SEC = 0.8
 
 try:  # 权限常量在 neobot_app.commands.model；取不到就按字面值 1（次级管理员）
     from neobot_app.commands.model import PERM_SUB_ADMIN as _PERM_SUB_ADMIN
@@ -181,6 +218,19 @@ class DownloadGate:
 
 
 @dataclass
+class LoginSession:
+    """一次扫码登录的上下文：谁发起的、往哪回、什么时候过期。"""
+
+    key: str
+    started_at: float
+    timeout_sec: float
+    chat_key: str
+    requester: str
+    #: 回消息用的发送器（命令路径/钩子路径各自包装，见 _Reply）
+    sender: Any
+
+
+@dataclass
 class Engine:
     """一次插件加载期内的全部运行时状态。重载即重建（换新模块命名空间）。"""
 
@@ -210,6 +260,8 @@ class Engine:
     recent_chats: Dict[str, float] = field(default_factory=dict)
     #: chat_key -> 本轮是否已经放过歌（挡模型一轮连放）
     turn_plays: Dict[str, float] = field(default_factory=dict)
+    #: 正在进行的扫码登录（同一时间只允许一个）
+    login: Optional["LoginSession"] = None
 
 
 #: 当前加载代的引擎。插件重载会换一份新的模块命名空间，因此这里是「本代」的状态。
@@ -1074,13 +1126,613 @@ async def _handle_unlock(
     await _reply_quiet(engine, ctx, conversation, "\n".join(lines))
 
 
+# ───────────────────────────────────────────── 扫码登录（/点歌登录）
+
+class _Reply:
+    """把「发文本 / 发图片」抽象出来，命令路径与钩子路径共用同一套登录流程。"""
+
+    def __init__(self, send_text: Any, send_image: Any) -> None:
+        self._send_text = send_text
+        self._send_image = send_image
+
+    async def text(self, value: str) -> None:
+        try:
+            await self._send_text(value)
+        except Exception:
+            pass
+
+    async def image(self, data: bytes, filename: str) -> bool:
+        try:
+            return bool(await self._send_image(data, filename))
+        except Exception:
+            return False
+
+
+def _command_sender(command_ctx: Any) -> _Reply:
+    """命令管线里的发送器（CommandService 自带 at 发起人 + 图片发送）。"""
+    service = getattr(command_ctx, "service", None)
+    kind = str(getattr(command_ctx, "kind", "") or "")
+    conv_id = str(getattr(command_ctx, "conv_id", "") or "")
+    user_id = getattr(command_ctx, "user_id", 0)
+
+    async def send_text(value: str) -> None:
+        await service.reply_to(kind, conv_id, value, at_user_id=user_id)
+
+    async def send_image(data: bytes, filename: str) -> bool:
+        return await service.send_image_bytes(
+            kind, conv_id, data, at_user_id=user_id, filename=filename
+        )
+
+    return _Reply(send_text, send_image)
+
+
+def _hook_sender(engine: Engine, ctx: Any, conversation: Any) -> _Reply:
+    """消息钩子里的发送器（群里没 @ 机器人时走这条）。"""
+
+    async def send_text(value: str) -> None:
+        await _reply_quiet(engine, ctx, conversation, value)
+
+    async def send_image(data: bytes, filename: str) -> bool:
+        try:
+            await ctx.send_image(conversation, data=data, filename=filename)
+            return True
+        except Exception as exc:
+            _warn(engine, "二维码图片发送失败（{}），改发链接".format(exc))
+            return False
+
+    return _Reply(send_text, send_image)
+
+
+async def _cancel_login(engine: Engine) -> None:
+    """中断当前扫码流程（幂等）。轮询任务发现 engine.login 不是自己就会自然退出。"""
+    engine.login = None
+
+
+def _login_running(engine: Engine) -> Optional[LoginSession]:
+    session = engine.login
+    if session is None:
+        return None
+    if _now() - session.started_at >= session.timeout_sec:
+        engine.login = None
+        return None
+    return session
+
+
+async def _start_login(engine: Engine, sender: _Reply, *, requester: str, chat_key: str) -> None:
+    """发起扫码登录：拿 unikey → 发二维码 → 起后台轮询。"""
+    current = _login_running(engine)
+    if current is not None:
+        left = int(current.timeout_sec - (_now() - current.started_at))
+        await sender.text(
+            "已经有一个登录流程在进行中（还有约 {} 秒）。\n"
+            "扫码后在手机上确认即可；想重来就发「/点歌登录 取消」，再发一次。".format(left)
+        )
+        return
+
+    await sender.text("正在向网易云申请登录二维码…")
+    result = await netease_login.request_unikey()
+    if not result.get("ok"):
+        await sender.text("生成二维码失败：{}".format(logic.cut(result.get("error"), 160)))
+        return
+
+    url = str(result.get("url") or "")
+    timeout_sec = max(30.0, float(engine.config.login_qr_timeout_sec or 180))
+    png = netease_login.make_qr_png(url)
+    sent_image = (await sender.image(png, "netease-login.png")) if png else False
+
+    caption = "📱 用手机网易云 App 扫下面的二维码登录（{} 秒内有效）".format(int(timeout_sec))
+    if not sent_image:
+        caption += "\n二维码没发出去，请手动打开这个链接，用另一台设备扫码：\n{}".format(url)
+    await sender.text(caption)
+
+    session = LoginSession(
+        key=str(result["key"]),
+        started_at=_now(),
+        timeout_sec=timeout_sec,
+        chat_key=chat_key,
+        requester=requester,
+        sender=sender,
+    )
+    engine.login = session
+    task = asyncio.create_task(_poll_login(engine, session))
+    engine.tasks.add(task)
+    task.add_done_callback(engine.tasks.discard)
+    _log(engine, "{} 发起网易云扫码登录（{} 秒内有效）".format(chat_key, int(timeout_sec)))
+
+
+async def _poll_login(engine: Engine, session: LoginSession) -> None:
+    """后台轮询扫码状态。
+
+    ⚠️ 节奏刻意放慢（3 秒 + 抖动）：轮询频率本身就是「像不像客户端」的信号之一，
+       而且用户扫完会主动点确认，没必要抢那几百毫秒。
+    """
+    failures = 0
+    last_state = ""
+    deadline = session.started_at + session.timeout_sec
+    try:
+        while _now() < deadline:
+            await asyncio.sleep(_LOGIN_POLL_SEC + random.uniform(0, _LOGIN_POLL_JITTER_SEC))
+            if engine.login is not session:
+                return  # 被取消，或被新的登录顶掉
+            if _now() >= deadline:
+                break
+            result = await netease_login.poll_once(session.key)
+            state = str(result.get("state") or "")
+            if state == netease_login.STATE_SCANNED and last_state != state:
+                await session.sender.text("👀 已扫码，请在手机上点「确认登录」…")
+            last_state = state
+
+            if state == netease_login.STATE_SUCCESS:
+                cookies = result.get("cookies") or {}
+                saved = login_store.save(engine.data_dir, cookies, source="qr")
+                engine.login = None
+                note = (
+                    "已保存，重启后仍然有效"
+                    if saved
+                    else "已生效，但写入磁盘失败（重启后需要重新扫码）"
+                )
+                await session.sender.text("✅ 网易云登录成功（{}）。现在可以直接点歌了。".format(note))
+                _log(engine, "{} 网易云扫码登录成功（{}）".format(session.chat_key, note))
+                return
+
+            if state == netease_login.STATE_EXPIRED:
+                engine.login = None
+                await session.sender.text("⌛ 二维码已失效，请重新发 /点歌登录。")
+                return
+
+            if state == netease_login.STATE_FAILED:
+                failures += 1
+                if result.get("transient") and failures < 3:
+                    continue  # 网络抖动：再试两次
+                engine.login = None
+                await session.sender.text(
+                    "❌ 扫码登录失败：{}".format(result.get("message") or "未知原因")
+                )
+                _warn(engine, "{} 扫码登录失败：{}".format(session.chat_key, result.get("message")))
+                return
+
+        if engine.login is session:
+            engine.login = None
+            await session.sender.text(
+                "⌛ 等太久了（{} 秒），二维码已作废。需要的话重新发 /点歌登录。".format(
+                    int(session.timeout_sec)
+                )
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        if engine.login is session:
+            engine.login = None
+        _warn(engine, "扫码登录轮询异常：{}".format(exc))
+        await session.sender.text("❌ 扫码登录过程出错：{}".format(logic.cut(exc, 120)))
+
+
+def _login_state_text(engine: Engine) -> Tuple[str, bool]:
+    """给状态输出用：返回 (登录态说明, 是否已登录)。"""
+    info = login_store.describe()
+    cfg = engine.config
+    if info["logged_in"]:
+        source = "扫码登录" if str(info.get("source")) == "qr" else (info.get("source") or "已保存")
+        age = login_store.age_text(float(info.get("saved_at") or 0.0))
+        return "✅ 已登录（{}，{}）".format(source, age or "刚刚"), True
+    if netease.parse_manual_cookie(cfg.cookie_secret):
+        return "✅ 使用设置里手填的 cookie", True
+    if cfg.use_client_cookie:
+        return "⚠ 未扫码；当前会尝试读本机客户端（旧方式）", False
+    return "⚠ 未登录 —— 发 /点歌登录 用手机扫码", False
+
+
+# ───────────────────────────────────────────── QQ 指令：状态 / 登录态 / 曲库
+
+_QUALITY_LABEL = {
+    "standard": "标准 128kbps",
+    "exhigh": "较高 320kbps",
+    "lossless": "无损 FLAC",
+}
+
+
+def _on_off(value: Any) -> str:
+    return "开" if value else "关"
+
+
+def _natural_key(text: str) -> List[Tuple[int, Any]]:
+    """自然排序：让「歌 (2)」排在「歌 (10)」前面，而不是按字符串比。"""
+    parts = re.split(r"(\d+)", str(text or "").lower())
+    key: List[Tuple[int, Any]] = []
+    for part in parts:
+        if not part:
+            continue
+        key.append((0, int(part)) if part.isdigit() else (1, part))
+    return key
+
+
+def _parse_library_args(raw: str) -> Tuple[str, int]:
+    """把 ``关键词 | 页码`` 拆开。``2`` / ``第2页`` / ``海阔 2`` 都认。"""
+    text = str(raw or "").strip()
+    if not text:
+        return "", 1
+    page = 1
+    match = re.search(r"(?:第\s*)?(\d{1,4})\s*页?\s*$", text)
+    if match is not None:
+        page = max(1, int(match.group(1)))
+        text = text[: match.start()].strip()
+    return text, page
+
+
+async def _render_status(engine: Engine, *, is_admin: bool) -> str:
+    """``/点歌状态`` 的正文。
+
+    为什么分管理员/普通两档：登录态来自哪个文件、下载目录、上次错误的完整文案
+    都属于「内部状态 → 群里可见」的泄露面。普通群友只看到「可用/不可用」就够了。
+    """
+    cfg = engine.config
+    stats = engine.stats
+    roots = _scan_roots(engine)
+    files = await _load_library(engine, roots)
+
+    lines: List[str] = ["🎤 点歌发语音条 · 状态", ""]
+    lines.append("开关：{}".format("已启用" if cfg.enabled else "已关闭"))
+    lines.append("触发：{}".format(" / ".join(cfg.trigger_list) or "（空）"))
+    lines.append("发送：语音条 {} 首{}".format(
+        stats.sent, "，最近《{}》".format(stats.last_song) if stats.last_song else ""
+    ))
+
+    # 网易云 / 登录态
+    if cfg.enable_download:
+        login_text, logged_in = _login_state_text(engine)
+        lines.append("登录：{}".format(login_text))
+        if logged_in:
+            lines.append(
+                "  音质 {}｜已下载 {} 首｜缓存命中 {}｜失败 {}".format(
+                    _QUALITY_LABEL.get(cfg.quality_key, cfg.quality_key),
+                    stats.downloads,
+                    stats.cache_hits,
+                    stats.download_fails,
+                )
+            )
+        else:
+            lines.append("  未登录时只能放本地曲库；发 /点歌登录 用手机扫码即可下载完整歌曲")
+        risk = netease.risk_status()
+        if risk["risk_cooldown_left"] > 0:
+            lines.append(
+                "  风控：冷却中，{} 秒后自动恢复（这期间不发请求）".format(
+                    int(risk["risk_cooldown_left"]) + 1
+                )
+            )
+        elif risk["endpoints_in_cooldown"]:
+            lines.append(
+                "  风控：{} 个搜索接口正在限流冷却".format(len(risk["endpoints_in_cooldown"]))
+            )
+        elif is_admin:
+            lines.append(
+                "  风控：请求间隔 {} 秒（带抖动）｜搜索/直链结果缓存 5 分钟".format(
+                    risk["min_interval_sec"]
+                )
+            )
+        if is_admin:
+            lines.append("  下载目录：{}".format(_download_dir(engine)))
+    else:
+        lines.append("网易云：未启用自动下载（只放本地曲库）")
+
+    # 曲库
+    if files:
+        lines.append("曲库：{} 首（{} 个目录）".format(len(files), len(roots)))
+        if is_admin and roots:
+            shown = "、".join(str(root) for root in roots[:3])
+            if len(roots) > 3:
+                shown += " 等"
+            lines.append("  {}".format(shown))
+    else:
+        lines.append("曲库：空")
+        lines.append("  去「配置」填「音乐文件夹」，或把歌放进 我的音乐\\CloudMusic")
+
+    # 限流
+    lines.append(
+        "限流：会话冷却 {}s｜本会话 {}/h｜全局 {}/h｜个人 {}/h".format(
+            cfg.cooldown_sec, cfg.max_per_chat_hour, cfg.max_per_hour, cfg.max_per_user_hour
+        )
+    )
+    if cfg.enable_download:
+        lines.append("下载限流：同曲冷却 {}min｜每小时 {} 首".format(
+            cfg.download_cooldown_min, cfg.download_per_hour
+        ))
+
+    # 待选 / 豁免
+    pending_line = "待选：{} 个会话在等回复".format(engine.pending.size)
+    exemptions = engine.exempt.list()
+    if exemptions:
+        pending_line += "｜豁免：{}".format(
+            "、".join(
+                "{} {}分".format(item["scope"], max(1, math.ceil(item["left_sec"] / 60)))
+                for item in exemptions[:3]
+            )
+        )
+    else:
+        pending_line += "｜豁免：无"
+    lines.append(pending_line)
+
+    if is_admin:
+        lines.append(
+            "同名多首：{}｜登记管理员 {} 人".format(
+                "每次都先选"
+                if cfg.always_ask
+                else ("难分高下才问" if cfg.ask_when_ambiguous else "直接挑最像的"),
+                len(cfg.admin_qq_list),
+            )
+        )
+        if stats.errors:
+            lines.append("累计错误：{} 次".format(stats.errors))
+        if stats.last_note:
+            lines.append("上次记录：{}".format(logic.cut(stats.last_note, 80)))
+
+    text = "\n".join(lines)
+    if not is_admin:
+        text += "\n\n（管理员可看更详细的路径/登录来源：/点歌状态）"
+    return text[:_CMD_MAX_CHARS]
+
+
+async def _render_library(engine: Engine, *, raw_args: str = "") -> str:
+    """``/点歌乐库`` 的正文：按文件名筛选、分页，只给当前页读 ID3 标签。"""
+    roots = _scan_roots(engine)
+    files = await _load_library(engine, roots)
+    if not files:
+        return (
+            "📚 曲库是空的。\n"
+            "去「插件 → netease-voice-song → 配置」填「音乐文件夹」，"
+            "或者把歌放进 我的音乐\\CloudMusic 再试。"
+        )
+
+    keyword, page = _parse_library_args(raw_args)
+    items = files
+    if keyword:
+        needle = logic.normalize_name(keyword)
+        items = [
+            item
+            for item in files
+            if needle and needle in logic.normalize_name(logic.strip_ext(item.get("name") or ""))
+        ]
+        if not items:
+            return "🔎 曲库里没有文件名含「{}」的歌（共 {} 首）。\n换个关键词，或直接发「点歌 {}」。".format(
+                logic.cut(keyword, 20), len(files), logic.cut(keyword, 20)
+            )
+
+    items = sorted(items, key=lambda item: _natural_key(logic.strip_ext(item.get("name") or "")))
+    total_pages = max(1, math.ceil(len(items) / _CMD_PAGE_SIZE))
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * _CMD_PAGE_SIZE
+    page_items = items[start : start + _CMD_PAGE_SIZE]
+    # 只给这一页读标签：整个曲库读一遍会把事件循环拖住
+    tagged = await _tag_files(engine, page_items)
+
+    head = "📚 曲库 {} 首（{} 个目录）".format(len(files), len(roots))
+    if keyword:
+        head += "｜筛选「{}」命中 {} 首".format(logic.cut(keyword, 20), len(items))
+    lines = [head]
+    if total_pages > 1:
+        lines.append("第 {}/{} 页 · 每页 {} 首".format(page, total_pages, _CMD_PAGE_SIZE))
+    for index, item in enumerate(tagged, start=start + 1):
+        name = logic.strip_id_suffix(logic.strip_ext(item.get("name") or ""))
+        artist = str(item.get("artist") or "").strip()
+        # 文件名里已经带歌手时别再重复一遍（很多下载命名是「歌手 - 歌名」）
+        if artist and logic.normalize_name(artist) in logic.normalize_name(name):
+            artist = ""
+        lines.append("{}. {}{}".format(index, name, " — " + artist if artist else ""))
+    hints: List[str] = []
+    if total_pages > 1:
+        hints.append("翻页：/点歌乐库 {}".format(page + 1 if page < total_pages else 1))
+    if not keyword:
+        hints.append("筛选：/点歌乐库 关键词")
+    hints.append("点歌：/点歌 歌名")
+    lines.append("｜".join(hints))
+    return "\n".join(lines)[:_CMD_MAX_CHARS]
+
+
+def _command_base_name(name: str) -> str:
+    if name.startswith(PLUGIN_NAME + "__"):
+        return name.split("__", 1)[1]
+    return name
+
+
+async def _handle_command(
+    engine: Engine, ctx: Any, event: Dict[str, Any], conversation: Any, chat_key: str
+) -> None:
+    """群里没 @ 机器人时的指令兜底（命令管线不会接管，插件自己回）。"""
+    name, raw_args = _parse_command(Message(event).text)
+    base = _command_base_name(name)
+    if base in (COMMAND_STATUS, *COMMAND_STATUS_ALIASES):
+        text = await _render_status(engine, is_admin=_is_admin(engine, _sender_id(event)))
+    elif base in (COMMAND_LIBRARY, *COMMAND_LIBRARY_ALIASES):
+        text = await _render_library(engine, raw_args=raw_args)
+    elif base in (COMMAND_LOGIN, *COMMAND_LOGIN_ALIASES):
+        requester = _sender_id(event)
+        if not _is_admin(engine, requester):
+            await _reply_quiet(
+                engine, ctx, conversation, "扫码登录会拿到整个网易云账号的登录态，只允许管理员操作。"
+            )
+            return
+        if raw_args.strip() in ("取消", "取消登录", "cancel"):
+            await _cancel_login(engine)
+            await _reply_quiet(engine, ctx, conversation, "已取消扫码登录。")
+            return
+        await _start_login(
+            engine,
+            _hook_sender(engine, ctx, conversation),
+            requester=requester,
+            chat_key=chat_key,
+        )
+        return
+    elif base in (COMMAND_LOGOUT, *COMMAND_LOGOUT_ALIASES):
+        requester = _sender_id(event)
+        if not _is_admin(engine, requester):
+            await _reply_quiet(engine, ctx, conversation, "退出登录只允许管理员操作。")
+            return
+        await _cancel_login(engine)
+        login_store.clear(engine.data_dir)
+        await _reply_quiet(engine, ctx, conversation, "已退出网易云登录（本机保存的 cookie 已删除）。")
+        return
+    else:
+        return
+    await _reply_quiet(engine, ctx, conversation, text)
+
+
+async def _command_status(command_ctx: Any) -> str:
+    """``/点歌状态``（命令管线路径）。"""
+    engine = _engine
+    if engine is None:
+        return "点歌插件还没准备好，稍后再试。"
+    user_id = str(getattr(command_ctx, "user_id", "") or "")
+    return await _render_status(engine, is_admin=_is_admin(engine, user_id))
+
+
+async def _command_library(command_ctx: Any) -> str:
+    """``/点歌乐库 [关键词] [页码]``（命令管线路径）。"""
+    engine = _engine
+    if engine is None:
+        return "点歌插件还没准备好，稍后再试。"
+    return await _render_library(
+        engine, raw_args=str(getattr(command_ctx, "raw_args", "") or "")
+    )
+
+
+async def _command_login(command_ctx: Any) -> Any:
+    """``/点歌登录 [取消]``：发二维码让手机扫码。"""
+    engine = _engine
+    if engine is None:
+        return "点歌插件还没准备好，稍后再试。"
+    user_id = str(getattr(command_ctx, "user_id", "") or "")
+    if not _is_admin(engine, user_id):
+        return "扫码登录会拿到整个网易云账号的登录态，只允许管理员操作。"
+    raw = str(getattr(command_ctx, "raw_args", "") or "").strip()
+    if raw in ("取消", "取消登录", "cancel"):
+        await _cancel_login(engine)
+        return "已取消扫码登录。"
+    sender = _command_sender(command_ctx)
+    await _start_login(
+        engine, sender, requester=user_id, chat_key=str(getattr(command_ctx, "conv_id", "") or "")
+    )
+    return None  # 消息已经由 _start_login 发出去了
+
+
+async def _command_logout(command_ctx: Any) -> str:
+    """``/点歌登出``：删掉保存的登录态。"""
+    engine = _engine
+    if engine is None:
+        return "点歌插件还没准备好，稍后再试。"
+    user_id = str(getattr(command_ctx, "user_id", "") or "")
+    if not _is_admin(engine, user_id):
+        return "退出登录只允许管理员操作。"
+    await _cancel_login(engine)
+    login_store.clear(engine.data_dir)
+    return "已退出网易云登录（本机保存的 cookie 已删除）。需要时重新发 /点歌登录 扫码。"
+
+
+def _register_commands(ctx: Any) -> None:
+    """把指令注册进本体命令表（/help 可见、重名自动改名、随插件卸载摘除）。"""
+    registrar = getattr(ctx, "app_commands", None)
+    if registrar is None or not getattr(registrar, "available", False):
+        try:
+            ctx.logger.warning(
+                "宿主没有提供命令注册表（app_commands 不可用），/点歌状态 等指令未注册；"
+                "自然语言点歌不受影响"
+            )
+        except Exception:
+            pass
+        return
+    try:
+        registrar.register(
+            COMMAND_STATUS,
+            description="查看点歌插件状态：网易云登录态、曲库规模、限流与最近一次发送",
+            usage="（无参数）",
+            aliases=COMMAND_STATUS_ALIASES,
+        )(_command_status)
+        registrar.register(
+            COMMAND_LIBRARY,
+            description="查看本机曲库：可按歌名筛选、可翻页",
+            usage="[关键词] [页码]",
+            aliases=COMMAND_LIBRARY_ALIASES,
+            params=(("关键词", "按文件名筛选，可省略"), ("页码", "默认第 1 页，每页 20 首")),
+        )(_command_library)
+        registrar.register(
+            COMMAND_LOGIN,
+            description="用手机网易云 App 扫码登录（之后可下载完整歌曲）；「取消」可中断",
+            usage="[取消]",
+            aliases=COMMAND_LOGIN_ALIASES,
+            params=(("取消", "中断当前的扫码流程，可省略"),),
+        )(_command_login)
+        registrar.register(
+            COMMAND_LOGOUT,
+            description="退出网易云登录（删除本机保存的 cookie）",
+            usage="（无参数）",
+            aliases=COMMAND_LOGOUT_ALIASES,
+        )(_command_logout)
+    except Exception as exc:
+        try:
+            ctx.logger.warning("注册点歌指令失败（不影响点歌本身）：{}".format(exc))
+        except Exception:
+            pass
+
+
 # ───────────────────────────────────────────── 接管判定（同步、零 IO）
+
+
+def _parse_command(text: str) -> Tuple[str, str]:
+    """把 ``/名字 参数`` 拆成 (名字, 参数)。不是指令形态就返回 ("", 原文)。"""
+    match = _COMMAND_HEAD_RE.match(text or "")
+    if match is None:
+        return "", str(text or "").strip()
+    return match.group(1), str(text or "")[match.end() :].strip()
+
+
+def _is_own_command(text: str) -> bool:
+    """这条消息是不是本插件的 /指令？
+
+    重名时宿主会把命令自动改名为 ``netease-voice-song__点歌状态``，
+    所以带前缀的形式也认。
+    """
+    name, _ = _parse_command(text)
+    if not name:
+        return False
+    if name in _OWN_COMMANDS:
+        return True
+    return name.startswith(PLUGIN_NAME + "__") and name.split("__", 1)[1] in _OWN_COMMANDS
+
+
+def _bot_mentioned(event: Dict[str, Any]) -> bool:
+    """群里这条消息有没有 @ 机器人（命令管线在群里要求 @）。"""
+    self_id = str(event.get("self_id") or "")
+    if not self_id:
+        return False
+    for segment in event.get("message") or []:
+        if not isinstance(segment, dict) or str(segment.get("type")) != "at":
+            continue
+        data = segment.get("data") or {}
+        if str(data.get("qq") or "") == self_id:
+            return True
+    return False
+
+
+def _command_will_handle(event: Dict[str, Any]) -> bool:
+    """这条 /指令 会不会被宿主的命令管线接走？
+
+    会 → 消息钩子让开（返回 ""），交给 CommandService：
+         它有权限判定、会出现在 /help、重名时会自动改名。
+    不会（群里没 @ 机器人）→ 插件自己回，免得用户觉得「发了指令没反应」。
+
+    ⚠️ 判断错方向的代价不对称：猜「会」而实际不会，最多是这条指令没响应；
+       猜「不会」而实际会，会出现**两条回复**（插件一条、命令管线一条）。
+       所以拿不准时一律让开。
+    """
+    if str(event.get("message_type") or "") != "group":
+        return True  # 私聊不需要 @
+    if not str(event.get("self_id") or ""):
+        return True  # 不知道机器人 QQ，就别抢
+    return _bot_mentioned(event)
 
 
 def _decide(event: Dict[str, Any]) -> str:
     """这条消息我们要不要接管？
 
-    返回 ``"song"`` / ``"choice"`` / ``"unlock"`` / ``""``（不接管）。
+    返回 ``"song"`` / ``"choice"`` / ``"unlock"`` / ``"cmd"`` / ``""``（不接管）。
 
     必须是**纯同步、零 IO** 的：它在每条消息的同步路径上被调用，
     一旦这里 await，就等于把决定权让回给宿主的回复管线。
@@ -1099,6 +1751,14 @@ def _decide(event: Dict[str, Any]) -> str:
             return ""
         chat_key = _conversation_key(event)
         sender_id = _sender_id(event)
+
+        # ⓪ 本插件的 /指令
+        #    ⚠️ 必须排在点歌之前：钩子比命令管线先跑，不让开的话
+        #       「/点歌状态」会被解析成点歌《状态》这首歌。
+        if _is_own_command(text):
+            if _command_will_handle(event):
+                return ""  # 交给命令管线（有权限判定、进 /help）
+            return "cmd"  # 群里没 @ 机器人：插件自己回
 
         # ① 管理员解除限制指令
         #    ⚠️ 必须在这里就确认**管理员身份**，不能只判断「像不像指令」：
@@ -1204,6 +1864,8 @@ def _dispatch(engine: Engine, kind: str, ctx: Any, event: Dict[str, Any]) -> Non
                 await _handle_unlock(engine, ctx, event, conversation, chat_key)
             elif kind == "choice":
                 await _handle_choice(engine, ctx, event, conversation, chat_key)
+            elif kind == "cmd":
+                await _handle_command(engine, ctx, event, conversation, chat_key)
             else:
                 await _handle_song(engine, ctx, event, conversation, chat_key)
 
@@ -1222,7 +1884,11 @@ plugin = Plugin(
         "点歌发语音条：群里说「点歌 歌名」，机器人先从本机音乐库找，"
         "本地没有就去网易云下载完整歌曲，再以 QQ 语音条发出来（0 token，不经过模型）。"
     ),
-    usage="直接发「点歌 歌名」/「来一首 歌名」；管理员可发「解除点歌限制 [本群|我|QQ号] [10分钟]」",
+    usage=(
+        "直接发「点歌 歌名」/「来一首 歌名」；"
+        "指令：/点歌登录（手机扫码）、/点歌状态、/点歌乐库 [关键词] [页码]、/点歌登出；"
+        "管理员可发「解除点歌限制 [本群|我|QQ号] [10分钟]」"
+    ),
     author="DSH（NeoBot 移植）",
     config=VoiceSongConfig,
     min_neobot_version="2.0.0",
@@ -1669,7 +2335,20 @@ async def _on_load(ctx: Any, config: VoiceSongConfig, logger: Any) -> None:
     _engine = _ensure_engine(ctx, config, logger)
     engine = _engine
 
+    _register_commands(ctx)
     cfg = engine.config
+    # 请求节流是「降风控」的第一道闸，按配置生效
+    netease.set_min_interval(cfg.netease_min_interval_sec)
+    # 上次扫码登录的结果落在这里；没有就等用户发 /点歌登录
+    saved_login = login_store.bootstrap(engine.data_dir)
+    if saved_login:
+        logger.info(
+            "网易云登录态：已载入扫码保存的登录（{}）".format(
+                login_store.age_text(float(saved_login.get("saved_at") or 0.0)) or "刚刚"
+            )
+        )
+    else:
+        logger.info("网易云登录态：还没有登录（发 /点歌登录 用手机扫码）")
     roots = _scan_roots(engine)
     logger.info(
         "点歌发语音条已加载：触发词「{}」；音乐目录 {} 个{}；最多 {}MB；同会话冷却 {} 秒".format(
@@ -1722,6 +2401,7 @@ async def _on_shutdown() -> None:
     _engine = None
     if engine is None:
         return
+    engine.login = None
     for task in list(engine.tasks):
         task.cancel()
     if engine.tasks:

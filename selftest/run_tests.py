@@ -455,6 +455,110 @@ async def download_tests():
         netease.search_songs, netease.song_url, netease.download_to = original
 
 
+# ───────────────────────────────────────────── 网络层（假 httpx，不联网）
+
+
+class _FakeHeaders(dict):
+    def get_list(self, name):
+        return self.get(name.lower(), [])
+
+
+class _FakeResponse:
+    def __init__(self, body=b"", *, json_text=None, content_type="audio/mpeg", status=200, set_cookie=None):
+        self.status_code = status
+        self._body = body
+        self.text = json_text or ""
+        self.headers = _FakeHeaders(
+            {
+                "content-length": str(len(body)),
+                "content-type": content_type,
+                "set-cookie": list(set_cookie or []),
+            }
+        )
+
+    async def aiter_bytes(self):
+        if self._body:
+            yield self._body
+
+
+class _FakeStream:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class _FakeClient:
+    """替身 httpx.AsyncClient：按用例返回预置响应。"""
+
+    responses = []
+    calls = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def stream(self, method, url):
+        _FakeClient.calls.append(("stream", url))
+        return _FakeStream(_FakeClient.responses.pop(0))
+
+    async def get(self, url):
+        _FakeClient.calls.append(("get", url))
+        return _FakeClient.responses.pop(0)
+
+    async def post(self, url, data=None):
+        _FakeClient.calls.append(("post", url))
+        return _FakeClient.responses.pop(0)
+
+
+async def transport_tests():
+    print("· 网络层：下载 / 风控（假 httpx）")
+    real_httpx = netease.httpx
+    netease.httpx = types.SimpleNamespace(AsyncClient=_FakeClient)
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp = Path(temp_dir)
+            # 下载成功
+            _FakeClient.responses = [_FakeResponse(b"\xff\xfb\x90\x00" + b"\x00" * 5000)]
+            _FakeClient.calls = []
+            got = await netease.download_to("https://example.invalid/a.mp3", temp / "a.mp3")
+            eq(got.get("ok"), True, "下载成功")
+            truthy((temp / "a.mp3").is_file(), "文件落地")
+
+            # 不是音频 → 判失败（不落盘）
+            _FakeClient.responses = [_FakeResponse(b"<html>nope</html>", content_type="text/html")]
+            got = await netease.download_to("https://example.invalid/b.mp3", temp / "b.mp3")
+            eq(got.get("ok"), False, "非音频内容判失败")
+
+            # 风控 -460 → 全局冷却，并且不发第二次请求
+            _FakeClient.responses = [
+                _FakeResponse(json_text='{"code": -460, "msg": "Cheating"}', content_type="application/json")
+            ]
+            _FakeClient.calls = []
+            res = await netease.request_json("GET", "https://music.163.com/api/whatever")
+            truthy(res.get("risk_limited"), "识别 -460", res)
+            truthy("风控" in (res.get("error") or ""), "错误文案说清风控", res)
+            left = netease.risk_status()["risk_cooldown_left"]
+            truthy(left > 0, "进入全局冷却", left)
+            before = len(_FakeClient.calls)
+            res2 = await netease.request_json("GET", "https://music.163.com/api/whatever")
+            eq(len(_FakeClient.calls), before, "冷却期间不再发请求")
+            truthy("冷却" in (res2.get("error") or ""), "冷却提示", res2)
+            netease._risk_until = 0.0  # 复位，别影响后面的用例
+    finally:
+        netease.httpx = real_httpx
+
+
+asyncio.run(transport_tests())
 asyncio.run(download_tests())
 
 # ───────────────────────────────────────────── 配置模型（假 pydantic）

@@ -1,7 +1,7 @@
 name = "netease-voice-song"
 repo = "gujin111/netease-voice-song"
 branch = "main"
-version = "1.7.0"
+version = "1.9.0"
 description = "点歌发语音条：群里说「点歌 歌名」，本地曲库优先，没有就去网易云下载完整歌曲，再以 QQ 语音条发出来"
 author = "DSH（NeoBot 移植）"
 dependencies = []
@@ -52,10 +52,14 @@ search_limit = 5
 # 开 = 缓存目录里已有的歌直接发，不重复下载。
 reuse_downloaded = true
 
-# ── 登录态 ──
-# 开 = 从本机已登录的网易云客户端读登录 cookie（只读、不写、不改客户端）。
-use_client_cookie = true
-# 手动填 cookie（可留空）。留空 = 用上面的自动读取；留空不会覆盖已有值。
+# ── 登录态（推荐用 /点歌登录 让手机扫码）──
+# 扫码二维码有效期（秒）。
+login_qr_timeout_sec = 180
+# 两次网易云 API 调用的最小间隔（秒，带抖动）。调大更保守、更不易被限流。
+netease_min_interval_sec = 1.5
+# 旧方式（默认关）：读本机已登录网易云客户端的 cookie。现在推荐手机扫码。
+use_client_cookie = false
+# 手动填 cookie（可留空，优先级最高）。留空不会覆盖已有值。
 cookie_secret = ""
 
 # ── 同名多首 ──

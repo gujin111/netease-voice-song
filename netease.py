@@ -25,7 +25,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +35,11 @@ try:  # NeoBot 本体依赖 httpx；缺失时只有「自动下载」降级，�
     import httpx
 except Exception:  # pragma: no cover - 仅在极简环境触发
     httpx = None  # type: ignore[assignment]
+
+try:
+    from . import login_store
+except ImportError:  # 单文件方式被 import 时（自测用文件路径加载）兜底
+    import login_store  # type: ignore[no-redef]
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -78,6 +85,168 @@ def _require_httpx() -> Any:
     if httpx is None:
         raise NeteaseUnavailable("缺少 httpx，无法访问网易云（本插件只做本地曲库播放）")
     return httpx
+
+
+# ───────────────────────────────────────────── 请求节流与风控
+#
+# 网易云的风控（``code: -460``）与限流（``code: 405``、HTTP 200 但「操作频繁」）
+# 不是随机出现的，几乎都能归到三类原因：
+#   ① 短时间打太多次（尤其是搜索和取直链）；
+#   ② 没有登录态 / 登录态残缺（缺 __csrf 之类），请求看起来不像正常客户端；
+#   ③ 换个写法反复重试同一首歌（越试越久，最后连正常请求也被牵连）。
+# 所以这里把「降风控」做成四条具体机制，而不是一句口号：
+#   · 全局请求节流：任意两次 API 调用之间至少隔 ``_min_interval_sec``（带抖动）；
+#   · 结果缓存：同一个关键词的搜索结果、同一首歌的直链，短时间复用，不重复请求；
+#   · 接口冷却：某个搜索接口被限流后，一段时间内直接跳过它（不硬撞）；
+#   · 风控冷却：一旦撞上 -460，全局暂停 5 分钟，期间直接快速失败而不是继续试。
+
+#: 两次 API 之间的最小间隔（秒）。0.5 以下很容易被判「操作频繁」。
+_min_interval_sec = 1.5
+#: 抖动上限（秒）：固定节奏比随机节奏更像脚本
+_JITTER_SEC = 0.8
+#: 搜索 / 直链结果缓存时长（秒）
+_CACHE_TTL_SEC = 300.0
+#: 某接口被限流后多久不再碰它（秒）
+_ENDPOINT_COOLDOWN_SEC = 600.0
+#: 撞上 -460 后全局冷却多久（秒）
+_RISK_COOLDOWN_SEC = 300.0
+
+_pace_lock: Optional[asyncio.Lock] = None
+#: 全局下载闸：同一时刻只下一个文件（多群同时点歌时不一起冲 CDN）
+_download_gate: Optional[asyncio.Semaphore] = None
+_last_request_at = 0.0
+_risk_until = 0.0
+_endpoint_cooldown: Dict[str, float] = {}
+_search_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_url_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def set_min_interval(seconds: Any) -> None:
+    """按配置调整节流间隔（0.5~10 秒，越界夹到边界）。"""
+    global _min_interval_sec
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return
+    _min_interval_sec = max(0.5, min(10.0, value))
+
+
+def _pace() -> asyncio.Lock:
+    """惰性创建节流锁（不在 import 期绑定事件循环）。"""
+    global _pace_lock
+    if _pace_lock is None:
+        _pace_lock = asyncio.Lock()
+    return _pace_lock
+
+
+def _download_slot() -> asyncio.Semaphore:
+    global _download_gate
+    if _download_gate is None:
+        _download_gate = asyncio.Semaphore(1)
+    return _download_gate
+
+
+async def _wait_turn() -> None:
+    global _last_request_at
+    lock = _pace()
+    async with lock:
+        now = time.monotonic()
+        wait = _last_request_at + _min_interval_sec - now
+        if wait > 0:
+            await asyncio.sleep(wait + random.uniform(0, _JITTER_SEC))
+        _last_request_at = time.monotonic()
+
+
+def risk_status() -> Dict[str, Any]:
+    """给状态命令用的风控快照。"""
+    now = time.monotonic()
+    return {
+        "min_interval_sec": _min_interval_sec,
+        "risk_cooldown_left": max(0.0, _risk_until - now),
+        "endpoints_in_cooldown": [
+            name for name, until in _endpoint_cooldown.items() if until > now
+        ],
+    }
+
+
+def _cache_get(cache: Dict[str, Tuple[float, Any]], key: str) -> Any:
+    hit = cache.get(key)
+    if hit is None:
+        return None
+    if time.monotonic() - hit[0] > _CACHE_TTL_SEC:
+        cache.pop(key, None)
+        return None
+    return hit[1]
+
+
+def _cache_put(cache: Dict[str, Tuple[float, Any]], key: str, value: Any) -> Any:
+    if len(cache) > 500:  # 简单容量兜底
+        oldest = min(cache.items(), key=lambda item: item[1][0], default=None)
+        if oldest is not None:
+            cache.pop(oldest[0], None)
+    cache[key] = (time.monotonic(), value)
+    return value
+
+
+async def request_json(
+    method: str,
+    url: str,
+    *,
+    data: Optional[Dict[str, str]] = None,
+    cookie: str = "",
+    timeout_sec: float = 12.0,
+) -> Dict[str, Any]:
+    """统一的 JSON 请求入口：节流 + 风控识别。
+
+    返回 ``{"json": dict, "status": int, "set_cookie": [str, ...]}`` 或 ``{"error": str, ...}``。
+    ``set_cookie`` 原样给出响应里的 Set-Cookie（扫码登录要靠它拿 MUSIC_U）。
+    """
+    global _risk_until
+    httpx_module = _require_httpx()
+    now = time.monotonic()
+    if now < _risk_until:
+        left = int(_risk_until - now) + 1
+        return {
+            "error": "网易云正在风控冷却（{} 秒后恢复）：这是「打太快」的保护，不是坏歌".format(left),
+            "risk_limited": True,
+        }
+    await _wait_turn()
+    try:
+        async with httpx_module.AsyncClient(
+            headers=headers(cookie), timeout=timeout_sec, follow_redirects=True
+        ) as client:
+            if method.upper() == "POST":
+                response = await client.post(url, data=data or {})
+            else:
+                response = await client.get(url)
+            text = response.text
+            set_cookie = response.headers.get_list("set-cookie")
+            status = response.status_code
+    except Exception as exc:  # 网络层错误：超时/连不上/DNS
+        name = type(exc).__name__
+        detail = "（超时）" if "Timeout" in name else "（{}）".format(name)
+        return {"error": "{}{}".format(exc, detail)}
+    try:
+        import json
+
+        payload = json.loads(text)
+    except Exception:
+        return {"error": "返回的不是 JSON（HTTP {}）".format(status)}
+    if not isinstance(payload, dict):
+        return {"error": "返回的不是 JSON 对象（HTTP {}）".format(status)}
+    code = payload.get("code")
+    if code == -460 or code == "-460":
+        _risk_until = time.monotonic() + _RISK_COOLDOWN_SEC
+        return {
+            "json": payload,
+            "status": status,
+            "set_cookie": set_cookie,
+            "risk_limited": True,
+            "error": "网易云触发了风控（-460），已暂停 {} 分钟；这期间不要再刷".format(
+                int(_RISK_COOLDOWN_SEC // 60)
+            ),
+        }
+    return {"json": payload, "status": status, "set_cookie": set_cookie}
 
 
 # ───────────────────────────────────────────── 登录态
@@ -137,17 +306,27 @@ def _join_cookie(values: Dict[str, str]) -> str:
     return "; ".join("{}={}".format(key, value) for key, value in values.items())
 
 
-def resolve_cookie(manual: str = "", allow_client: bool = True) -> Dict[str, str]:
-    """取登录态。顺序：设置里手填的 cookie → 本机客户端文件。
+def resolve_cookie(manual: str = "", allow_client: bool = False, saved: Optional[str] = None) -> Dict[str, str]:
+    """取登录态。优先级：设置里手填 → ``/点歌登录`` 扫码保存的 → 旧的本机客户端文件。
 
-    每次下载都重新调一次（客户端重新登录后能自动跟上）。
+    ``allow_client`` 默认 **False**：本机客户端那条路是 1.7.0 的做法，现在改用
+    手机扫码登录（``/点歌登录``）。老用户想继续用客户端 cookie 可以把它打开。
+
+    每次下载都重新调一次（重新登录后能立刻跟上）。
     返回 ``{"cookie": str, "source": str}`` 或 ``{"error": str}``。
     """
     manual_values = parse_manual_cookie(manual)
     if manual_values.get("MUSIC_U") or manual_values.get("MUSIC_A"):
         return {"cookie": _join_cookie(manual_values), "source": "设置里手填"}
+
+    saved_cookie = saved if saved is not None else login_store.get_current()
+    if saved_cookie:
+        return {"cookie": saved_cookie, "source": "扫码登录（已保存）"}
+
     if not allow_client:
-        return {"error": "没有可用的登录态（已关闭自动读取本机客户端，也没手填 cookie）"}
+        return {
+            "error": "还没有登录：发 /点歌登录 用手机扫码（或在设置里手填 cookie）"
+        }
     for path in cookie_file_candidates():
         try:
             if not path.is_file():
@@ -166,34 +345,30 @@ def resolve_cookie(manual: str = "", allow_client: bool = True) -> Dict[str, str
     return {"error": "读不到本机网易云客户端的登录态（没装客户端、没登录，或文件位置变了）"}
 
 
-def _headers(cookie: str = "") -> Dict[str, str]:
-    headers = {"User-Agent": USER_AGENT, "Referer": REFERER, "Accept": "*/*"}
+def headers(cookie: str = "") -> Dict[str, str]:
+    """尽量像浏览器：UA + Referer + Accept-Language + 常见客户端头。
+
+    缺 Referer / UA 的请求在网易云那边很显眼，是「看起来像脚本」的主要特征之一。
+    """
+    result = {
+        "User-Agent": USER_AGENT,
+        "Referer": REFERER,
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Origin": "https://music.163.com",
+    }
     if cookie:
-        headers["Cookie"] = cookie
-    return headers
+        result["Cookie"] = cookie
+    return result
+
+
+#: 兼容旧调用点
+_headers = headers
 
 
 async def _get_json(url: str, *, cookie: str = "", timeout_sec: float = 12.0) -> Dict[str, Any]:
-    httpx_module = _require_httpx()
-    try:
-        async with httpx_module.AsyncClient(
-            headers=_headers(cookie), timeout=timeout_sec, follow_redirects=True
-        ) as client:
-            response = await client.get(url)
-            text = response.text
-    except Exception as exc:  # 网络层错误：超时/连不上/DNS
-        name = type(exc).__name__
-        detail = "（超时）" if "Timeout" in name else "（{}）".format(name)
-        return {"error": "{}{}".format(exc, detail)}
-    try:
-        import json
-
-        payload = json.loads(text)
-    except Exception:
-        return {"error": "返回的不是 JSON（HTTP {}）".format(response.status_code)}
-    if not isinstance(payload, dict):
-        return {"error": "返回的不是 JSON 对象（HTTP {}）".format(response.status_code)}
-    return {"json": payload, "status": response.status_code}
+    """GET + JSON，走统一的节流/风控入口。"""
+    return await request_json("GET", url, cookie=cookie, timeout_sec=timeout_sec)
 
 
 def _artist_of(song: Dict[str, Any]) -> str:
@@ -233,14 +408,27 @@ async def search_songs(
     if not wanted:
         return {"ok": False, "empty": True, "error": "歌名是空的"}
     limit = max(1, min(30, int(limit or 5)))
+
+    # 同一个关键词 5 分钟内不重复请求：群友反复点同一首歌时，这一步能省掉绝大多数请求
+    cache_key = "{}|{}".format(wanted.lower(), limit)
+    cached = _cache_get(_search_cache, cache_key)
+    if cached is not None:
+        return cached
+
     from urllib.parse import quote
 
     encoded = quote(wanted, safe="")
     tried: List[str] = []
     saw_rate_limit = False
     saw_request_failure = False
+    now = time.monotonic()
 
     for name, template in _SEARCH_ENDPOINTS:
+        # 这个接口刚被限流过：直接跳过，别硬撞（撞一次就把冷却续长）
+        if _endpoint_cooldown.get(name, 0.0) > now:
+            saw_rate_limit = True
+            tried.append("{}:冷却中".format(name))
+            continue
         url = template.format(kw=encoded, limit=limit)
         result = await _get_json(url, timeout_sec=timeout_sec)
         if result.get("error"):
@@ -252,6 +440,7 @@ async def search_songs(
         # 405 = 操作频繁（限流）。这时**不能**当成「没搜到」，必须换接口重试。
         if code == 405:
             saw_rate_limit = True
+            _endpoint_cooldown[name] = time.monotonic() + _ENDPOINT_COOLDOWN_SEC
             tried.append("{}:被限流".format(name))
             continue
         raw_songs = _pick_songs(payload)
@@ -285,7 +474,7 @@ async def search_songs(
         if not songs:
             tried.append("{}:结果字段不全".format(name))
             continue
-        return {"ok": True, "songs": songs, "endpoint": name}
+        return _cache_put(_search_cache, cache_key, {"ok": True, "songs": songs, "endpoint": name})
 
     if saw_rate_limit and not saw_request_failure:
         return {
@@ -324,10 +513,19 @@ async def song_url(
     quality: str = "exhigh",
     timeout_sec: float = 12.0,
 ) -> Dict[str, Any]:
-    """取某个音质的下载直链。"""
+    """取某个音质的下载直链。
+
+    同一首歌同一个音质的直链缓存 5 分钟：直链本身有效期远长于此，
+    而「同一首歌被反复点」是最常见的重复请求来源。
+    """
     from urllib.parse import quote
 
     profile = QUALITY.get(str(quality)) or QUALITY["exhigh"]
+    cache_key = "{}|{}".format(song_id, profile["level"])
+    cached = _cache_get(_url_cache, cache_key)
+    if cached is not None:
+        return cached
+
     url = (
         "https://music.163.com/api/song/enhance/player/url/v1?ids=[{}]"
         "&level={}&encodeType={}"
@@ -344,19 +542,20 @@ async def song_url(
         code = None
     if not data.get("url") or (code is not None and code != 200):
         if code == -110:
-            hint = (
-                "登录态无效或已过期（code=-110）—— 打开网易云客户端重新登录一次即可，"
-                "插件会自己跟上"
-            )
+            hint = "登录态无效或已过期（code=-110）—— 发 /点歌登录 用手机重新扫码即可"
         else:
             hint = "官方返回 code={}".format(code if code is not None else "未知")
         return {"ok": False, "code": code, "error": hint}
-    return {
-        "ok": True,
-        "url": str(data["url"]),
-        "br": int(data.get("br") or 0),
-        "size": int(data.get("size") or 0),
-    }
+    return _cache_put(
+        _url_cache,
+        cache_key,
+        {
+            "ok": True,
+            "url": str(data["url"]),
+            "br": int(data.get("br") or 0),
+            "size": int(data.get("size") or 0),
+        },
+    )
 
 
 def _looks_like_audio(content_type: str, head: bytes) -> bool:
@@ -388,11 +587,36 @@ async def download_to(
     紧接着重试就成功。没有重试的话，用户在群里看到的是「下载失败」，
     而其实再试一次就好。只重试「传输层失败」，HTTP 4xx/5xx 与
     「下到的不是音频」不重试（重试也没用）。
+
+    ⚠️ 全局只允许一个下载同时在跑：多群同时点歌时一起冲 CDN 既慢又显眼。
     """
     httpx_module = _require_httpx()
     attempts = max(1, min(5, int(retries) + 1))
     last_error = ""
     dest = Path(dest)
+    async with _download_slot():
+        return await _download_to_locked(
+            httpx_module,
+            url,
+            dest,
+            cookie=cookie,
+            max_bytes=max_bytes,
+            timeout_sec=timeout_sec,
+            attempts=attempts,
+        )
+
+
+async def _download_to_locked(
+    httpx_module: Any,
+    url: str,
+    dest: Path,
+    *,
+    cookie: str,
+    max_bytes: int,
+    timeout_sec: float,
+    attempts: int,
+) -> Dict[str, Any]:
+    last_error = ""
     for attempt in range(1, attempts + 1):
         try:
             async with httpx_module.AsyncClient(

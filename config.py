@@ -107,11 +107,26 @@ class VoiceSongConfig(BaseModel):
     )
 
     # ── 登录态 ──
-    use_client_cookie: bool = Field(
-        default=True,
+    login_qr_timeout_sec: int = Field(
+        default=180, ge=30, le=900,
         description=(
-            "开（默认）= 从本机已登录的网易云客户端读登录 cookie（只读、不写、不改客户端），"
-            "这样才能下到**完整歌曲**。关掉就必须在下面手填 cookie。"
+            "扫码登录二维码的有效期（秒，默认 180）。超时后二维码作废，"
+            "需要重新发 /点歌登录。"
+        ),
+    )
+    netease_min_interval_sec: float = Field(
+        default=1.5, ge=0.5, le=10,
+        description=(
+            "两次网易云 API 调用之间的最小间隔（秒，默认 1.5，带随机抖动）。"
+            "调大更保守、更不容易被限流；调到 0.5 附近会明显增加「操作频繁」的概率。"
+        ),
+    )
+    use_client_cookie: bool = Field(
+        default=False,
+        description=(
+            "旧方式（默认关）：从本机已登录的网易云客户端读 cookie。"
+            "现在推荐用 /点歌登录 让手机扫码；只有在机器人就跑在你自己电脑上、"
+            "且不想扫码时才打开它。"
         ),
     )
     cookie_secret: str = Field(
