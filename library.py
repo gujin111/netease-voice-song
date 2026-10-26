@@ -166,7 +166,10 @@ def load_library(
         files.extend(collect_audio_files(root, max_depth=max_depth, max_files=max_files, deadline=deadline))
         if time.monotonic() > deadline or len(files) >= max_files:
             break
-    if cache is not None:
+    # ⚠️ 只缓存**扫完的**结果：被时间/条数截断的那一份如果也进缓存，接下来 5 分钟里
+    #    后半部分的歌都会被当成「本地没有」，于是明明有歌也要重新下载一遍。
+    complete = len(files) < max_files and time.monotonic() <= deadline
+    if cache is not None and complete:
         cache.set(key, files)
     return files
 
@@ -268,7 +271,23 @@ def read_audio_tags(path: str, *, max_bytes: int = 1024 * 1024) -> Dict[str, str
                 )
                 offset = 10
                 if flags & 0x40:  # extended header
-                    offset += 4
+                    # 长度语义跟版本走：v2.3 的大小字段**不含**自身（还要再跳那 4 字节），
+                    # v2.4 的大小字段**含**自身。以前固定 += 4，两个版本都会停在扩展头中间，
+                    # 后面每个 frame_id 都对不上 → 整段标签读不出来。
+                    if len(head) >= 14:
+                        size_bytes = head[10:14]
+                        if major >= 4:
+                            ext_size = (
+                                ((size_bytes[0] & 0x7F) << 21)
+                                | ((size_bytes[1] & 0x7F) << 14)
+                                | ((size_bytes[2] & 0x7F) << 7)
+                                | (size_bytes[3] & 0x7F)
+                            )
+                            offset += ext_size if ext_size >= 6 else 6
+                        else:
+                            ext_size = int.from_bytes(size_bytes, "big")
+                            offset += 4 + ext_size
+                        offset = min(offset, len(head))
                 end = min(len(head), 10 + tag_size)
                 while offset + 10 <= end:
                     frame_id = head[offset : offset + 4].decode("latin-1", "ignore")

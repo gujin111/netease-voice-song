@@ -83,10 +83,17 @@ def load(data_dir: Any) -> Dict[str, Any]:
     cookies = data.get("cookies")
     if not isinstance(cookies, dict):
         return {}
+    # ⚠️ 这个转换必须在「返回空字典」的保护里：saved_at 被手改成字符串/对象时，
+    #    float() 会抛 ValueError/TypeError，而 bootstrap() 在 on_load 里是无保护调用的
+    #    —— 一个脏字段就能让整个插件加载失败（点歌全部不可用），而不是「当作没登录」。
+    try:
+        saved_at = float(data.get("saved_at") or 0.0)
+    except (TypeError, ValueError):
+        saved_at = 0.0
     return {
         "cookies": {str(k): str(v) for k, v in cookies.items() if v},
         "source": str(data.get("source") or "qr"),
-        "saved_at": float(data.get("saved_at") or 0.0),
+        "saved_at": saved_at,
     }
 
 
@@ -117,8 +124,10 @@ def describe() -> Dict[str, Any]:
     """给状态输出用的摘要（**不含 cookie 值**）。"""
     if not _current_cookie:
         return {"logged_in": False, "source": "", "saved_at": 0.0, "pending": False}
+    # 第 2 段起的 key 前面会带一个空格（"K=V; K2=V2"），不 strip 的话
+    # MUSIC_U 不是第一个 cookie 时就会误判成「未登录」，而下载其实用得好好的。
     keys = [
-        part.split("=", 1)[0]
+        part.split("=", 1)[0].strip()
         for part in _current_cookie.split(";")
         if "=" in part
     ]

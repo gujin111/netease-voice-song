@@ -108,18 +108,28 @@ async def request_unikey(*, timeout_sec: float = 12.0) -> Dict[str, Any]:
             "ok": False,
             "error": "网易云没有返回二维码 key（code={}）".format(code if code is not None else "未知"),
         }
-    return {"ok": True, "key": key, "url": QR_URL_TEMPLATE.format(key=key)}
+    return {
+        "ok": True,
+        "key": key,
+        "url": QR_URL_TEMPLATE.format(key=key),
+        # 这一次的 Set-Cookie 也要留着：__csrf/NMTID 可能只在这里下发，
+        # 只保存 803 那一次的话，登录态会只剩 MUSIC_U——正是 -460 的诱因之一。
+        "set_cookie": result.get("set_cookie") or [],
+    }
 
 
-async def poll_once(key: str, *, timeout_sec: float = 12.0) -> Dict[str, Any]:
+async def poll_once(key: str, *, cookie: str = "", timeout_sec: float = 12.0) -> Dict[str, Any]:
     """第 3 步：查一次扫码状态。
 
+    ``cookie`` 是流程里已经攒到的 cookie（unikey / 之前的轮询），带上它，
+    后续轮询的响应才可能补齐 __csrf/NMTID。
     返回 ``{"state": ..., "code": int, "cookies": {...}, "message": str}``。
     """
     result = await netease.request_json(
         "POST",
         POLL_URL,
         data={"key": key, "type": "1"},
+        cookie=cookie,
         timeout_sec=timeout_sec,
     )
     if result.get("error"):

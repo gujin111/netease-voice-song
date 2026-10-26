@@ -421,16 +421,28 @@ async def search_songs(
     tried: List[str] = []
     saw_rate_limit = False
     saw_request_failure = False
+    saw_risk = False
+    risk_error = ""
+    skipped_cooling: List[str] = []
     now = time.monotonic()
 
     for name, template in _SEARCH_ENDPOINTS:
         # 这个接口刚被限流过：直接跳过，别硬撞（撞一次就把冷却续长）
         if _endpoint_cooldown.get(name, 0.0) > now:
-            saw_rate_limit = True
+            # ⚠️ 只是「这次不碰它」，**不能**算成「被限流」：否则其它接口正常、
+            #    这首歌确实不存在时，用户看到的是「接口正在限流，过一会儿再试」
+            #    （最长误报 10 分钟），与「真没结果」正好相反。
+            skipped_cooling.append(name)
             tried.append("{}:冷却中".format(name))
             continue
         url = template.format(kw=encoded, limit=limit)
         result = await _get_json(url, timeout_sec=timeout_sec)
+        if result.get("risk_limited"):
+            # -460 风控冷却：不是网络问题，别把原因吞成「连不上网易云」
+            saw_risk = True
+            risk_error = str(result.get("error") or "网易云风控冷却中")
+            tried.append("{}:风控冷却".format(name))
+            continue
         if result.get("error"):
             saw_request_failure = True
             tried.append("{}:请求失败".format(name))
@@ -476,6 +488,14 @@ async def search_songs(
             continue
         return _cache_put(_search_cache, cache_key, {"ok": True, "songs": songs, "endpoint": name})
 
+    if saw_risk:
+        return {
+            "ok": False,
+            "rate_limited": True,
+            "risk_limited": True,
+            "error": risk_error,
+            "tried": tried,
+        }
     if saw_rate_limit and not saw_request_failure:
         return {
             "ok": False,
@@ -498,10 +518,15 @@ async def search_songs(
             "error": "搜索没成功：{}".format("、".join(tried)),
             "tried": tried,
         }
+    cooling_note = (
+        "（{} 个搜索接口正在冷却，过几分钟再试更稳）".format(len(skipped_cooling))
+        if skipped_cooling
+        else ""
+    )
     return {
         "ok": False,
         "empty": True,
-        "error": "没搜到「{}」（网易云真的没有匹配结果）".format(wanted),
+        "error": "没搜到「{}」（网易云真的没有匹配结果）{}".format(wanted, cooling_note),
         "tried": tried,
     }
 
@@ -546,6 +571,16 @@ async def song_url(
         else:
             hint = "官方返回 code={}".format(code if code is not None else "未知")
         return {"ok": False, "code": code, "error": hint}
+    # 非会员账号点 VIP 歌曲时，官方会返回 code=200 + 一条**试听**直链
+    # （freeTrialInfo 非空、时长只有 30~45 秒）。不判它就会把片段当完整歌曲缓存 5 分钟，
+    # 群里收到的是半首歌 —— 比「下载失败」更难解释。
+    if data.get("freeTrialInfo"):
+        return {
+            "ok": False,
+            "code": code,
+            "free_trial": True,
+            "error": "这首只返回了试听片段（需要会员账号才能取到完整音频）",
+        }
     return _cache_put(
         _url_cache,
         cache_key,
@@ -672,15 +707,22 @@ async def _download_to_locked(
                 "tries": attempt,
             }
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
+            # 25~30MB 一次性写盘放在事件循环上，机械盘/杀毒扫描时能卡住所有会话
+            # 几百毫秒到数秒 —— 和「扫描曲库」「读 ID3」一样丢线程。
             part = dest.with_name(dest.name + ".part")
-            part.write_bytes(body)
-            os.replace(str(part), str(dest))
+            await asyncio.to_thread(_write_file_atomic, part, dest, body)
         except OSError as exc:
             return {"ok": False, "error": "写入失败：{}".format(exc), "tries": attempt}
         return {"ok": True, "bytes": len(body), "content_type": content_type, "tries": attempt}
 
     return {"ok": False, "error": last_error or "下载失败", "tries": attempts}
+
+
+def _write_file_atomic(part: Path, dest: Path, body: bytes) -> None:
+    """先写 ``.part`` 再原子替换：进程被杀也不会留下半个文件被当成缓存。"""
+    part.parent.mkdir(parents=True, exist_ok=True)
+    part.write_bytes(body)
+    os.replace(str(part), str(dest))
 
 
 # ───────────────────────────────────────────── 下载缓存

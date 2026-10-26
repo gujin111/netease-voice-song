@@ -220,7 +220,7 @@ async def main():
     print("· 插件注册")
     plugin = module.plugin
     eq(plugin.name, "netease-voice-song", "插件名")
-    eq(plugin.version, "1.9.2", "版本")
+    eq(plugin.version, "1.9.3", "版本")
     eq(plugin.min_neobot_version, "2.0.0", "最低本体版本")
     rules = [item for item in plugin.messages if item.get("rule") is not None]
     eq(len(rules), 1, "一条带 rule 的消息注册")
@@ -612,17 +612,33 @@ async def main():
         module._engine.config = config
 
         print("· 指令：曲库 列表 / 筛选 / 翻页")
-        library_text = await module._command_library(Cmd(""))
-        check("曲库 1 首" in library_text, "列表显示总数", library_text)
-        check("1. 海阔天空" in library_text, "列表里有那首歌", library_text)
-        check("/vs-library" in library_text or "翻页" in library_text, "给了翻页/筛选提示", library_text)
-        hit_text = await module._command_library(Cmd("海阔"))
-        check("筛选「海阔」命中 1 首" in hit_text, "关键词筛选", hit_text)
-        miss_text = await module._command_library(Cmd("不存在的歌"))
-        check("没有文件名含" in miss_text, "没命中时说清楚", miss_text)
-        page_text = await module._command_library(Cmd("第9页"))
-        check("1. 海阔天空" in page_text, "越界页码回到最后一页（仍能列出内容）", page_text)
-        check("第 1/1 页" not in page_text, "只有一页时不显示页码行", page_text)
+        # 普通群友：只看得到数量，看不到文件名（文件名可能带歌手 / 私人录音名）
+        guest_lib = await module._command_library(Cmd(""))
+        check("曲库 1 首" in guest_lib, "普通群友看得到总数", guest_lib)
+        check("1. 海阔天空" not in guest_lib, "普通群友看不到文件名", guest_lib)
+        check("只对管理员开放" in guest_lib, "说清楚为什么看不到", guest_lib)
+
+        module._engine.config = with_config(config, admin_qqs="123456")
+        try:
+            library_text = await module._command_library(Cmd("", user_id=123456))
+            check("曲库 1 首" in library_text, "列表显示总数", library_text)
+            check("1. 海阔天空" in library_text, "列表里有那首歌", library_text)
+            check("/vs-library" in library_text or "翻页" in library_text, "给了翻页/筛选提示", library_text)
+            hit_text = await module._command_library(Cmd("海阔", user_id=123456))
+            check("筛选「海阔」命中 1 首" in hit_text, "关键词筛选", hit_text)
+            miss_text = await module._command_library(Cmd("不存在的歌", user_id=123456))
+            check("没有文件名含" in miss_text, "没命中时说清楚", miss_text)
+            page_text = await module._command_library(Cmd("第9页", user_id=123456))
+            check("1. 海阔天空" in page_text, "越界页码回到最后一页（仍能列出内容）", page_text)
+            check("第 1/1 页" not in page_text, "只有一页时不显示页码行", page_text)
+            numeric = await module._command_library(Cmd("1987", user_id=123456))
+            check(
+                "没有文件名含「1987」" in numeric,
+                "纯数字当关键词，不是第 1987 页",
+                numeric,
+            )
+        finally:
+            module._engine.config = config
 
         print("· 指令：点和「点歌」开头的消息不再冲突")
         # 旧指令名 → 提示改名（不能被当成「点一首叫《状态》的歌」）
@@ -791,15 +807,20 @@ async def main():
                 "ok": True,
                 "key": "KEY-2",
                 "url": "https://music.163.com/login?codekey=KEY-2",
+                # 真实接口会给 Set-Cookie；这一条验证「unikey 下发的 cookie 也会被攒起来」
+                "set_cookie": ["__csrf=csrf-from-unikey; Path=/"],
             }
 
-        async def fake_poll_once(key, *, timeout_sec=12.0):
+        async def fake_poll_once(key, *, cookie="", timeout_sec=12.0):
+            polled_cookies.append(cookie)
             return {
                 "state": "success",
                 "code": 803,
                 "cookies": {"MUSIC_U": "qr-ok", "__csrf": "c1"},
                 "message": "登录成功",
             }
+
+        polled_cookies = []
 
         login.request_unikey = fake_unikey
         login.poll_once = fake_poll_once
@@ -899,6 +920,127 @@ async def main():
         print("· 关闭开关后完全放手")
         module._engine.config = with_config(config, enabled=False)
         eq(module._message_rule(text_event("点歌 海阔天空")), False, "关掉后不接管")
+        module._engine.config = config
+
+        print("· 回归：/点歌帮助 等旧指令名直接执行（不再被当成歌名）")
+        import inspect as _inspect
+
+        check(
+            _inspect.iscoroutinefunction(module._command_help),
+            "命令处理器是协程函数（宿主是 await 调用，同步函数会报 can't be used in 'await'）",
+        )
+        for legacy_name, expect in (
+            ("点歌帮助", "全部指令"),
+            ("点歌状态", "点歌发语音条"),
+            ("点歌乐库", "曲库"),
+        ):
+            legacy_event = text_event("/" + legacy_name, user_id=456, message_id=700 + len(legacy_name))
+            eq(module._message_rule(legacy_event), True, "旧名 /{} 被接管".format(legacy_name))
+            sent_before = len(ctx.sent)
+            audio_before = len(ctx.audio)
+            await module._on_message(legacy_event, ctx, config)
+            await drain(module)
+            new_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
+            check(any("改名为" in line for line in new_text), "旧名给了改名说明", new_text)
+            check(any(expect in line for line in new_text), "旧名真的执行了对应指令", new_text)
+            eq(len(ctx.audio), audio_before, "旧名没有被当成点歌放歌")
+
+        # 旧名 /点歌登录 也不能绕过管理员校验（这是安全边界，不是文案问题）
+        sent_before = len(ctx.sent)
+        login_event = text_event("/点歌登录", user_id=456, message_id=760)
+        await module._on_message(login_event, ctx, config)
+        await drain(module)
+        login_text = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str)]
+        check(any("管理员" in line for line in login_text), "非管理员用旧名也被拒", login_text)
+        eq(module._engine.login, None, "没有因此起一个登录流程")
+
+        print("· 回归：关掉自动下载就一条网都不联")
+        calls = {"search": 0}
+        real_search = netease.search_songs
+
+        async def counting_search(keyword, *, limit=5, timeout_sec=12.0):
+            calls["search"] += 1
+            return {"ok": True, "songs": [], "endpoint": "fake"}
+
+        netease.search_songs = counting_search
+        try:
+            off_cfg = with_config(
+                config,
+                always_ask=True,
+                enable_download=False,
+                reply_on_failure=True,
+                cooldown_sec=0,
+                max_per_chat_hour=0,
+                max_per_hour=0,
+                max_per_user_hour=0,
+            )
+            module._engine.config = off_cfg
+            module._engine.pending.clear()
+            module._engine.index_cache.clear()
+            sent_before = len(ctx.sent)
+            audio_before = len(ctx.audio)
+            event = text_event("点歌 海阔天空", message_id=810)
+            await module._on_message(event, ctx, off_cfg)
+            await drain(module)
+            eq(calls["search"], 0, "关掉自动下载后一次搜索都没发")
+            eq(len(ctx.audio), audio_before, "也没有发歌")
+            listed = [p for _, p in ctx.sent[sent_before:] if isinstance(p, str) and "回数字选" in p]
+            check(bool(listed), "仍然把本地候选列出来了", listed)
+            check("本机找到" in listed[-1], "文案说清楚只有本地，不承诺下载", listed[-1:])
+        finally:
+            netease.search_songs = real_search
+
+        print("· 回归：默认配置下 max_file_mb 仍然管用（选择路径）")
+        big = music / "大地.mp3"
+        big.write_bytes(b"\xff\xfb\x90\x00" + b"\x00" * (2 * 1024 * 1024))
+        module._engine.index_cache.clear()
+        cap_cfg = with_config(
+            config,
+            always_ask=True,
+            enable_download=False,
+            reply_on_failure=True,
+            max_file_mb=1,
+            cooldown_sec=0,
+            max_per_chat_hour=0,
+            max_per_hour=0,
+            max_per_user_hour=0,
+        )
+        module._engine.config = cap_cfg
+        module._engine.pending.clear()
+        event = text_event("点歌 大地", message_id=820)
+        await module._on_message(event, ctx, cap_cfg)
+        await drain(module)
+        sent_before = len(ctx.sent)
+        audio_before = len(ctx.audio)
+        await module._on_message(text_event("1", message_id=821), ctx, cap_cfg)
+        await drain(module)
+        eq(len(ctx.audio), audio_before, "超过 max_file_mb 的文件没发出去")
+        check(
+            any("超过上限" in p for _, p in ctx.sent[sent_before:] if isinstance(p, str)),
+            "回了一句「超过上限」",
+            [p for _, p in ctx.sent[sent_before:]],
+        )
+        big.unlink()
+
+        print("· 回归：解除限制「全部」覆盖别的会话 / 下载闸按会话记账")
+        module._engine.exempt.clear()
+        admin_cfg = with_config(config, admin_qqs="123456", unlock_default_min=10)
+        module._engine.config = admin_cfg
+        event = text_event("解除点歌限制 全部 10分钟", user_id=123456, message_id=830)
+        await module._on_message(event, ctx, admin_cfg)
+        await drain(module)
+        check(module._engine.exempt.check("group:999", "777")["exempt"], "别的会话也被豁免")
+
+        gate = module.DownloadGate()
+        dcfg = config_module.VoiceSongConfig(download_per_hour=2, download_cooldown_min=10)
+        gate.commit(dcfg, "海阔天空", "group:1")
+        gate.commit(dcfg, "晴天", "group:1")
+        gate.reset("chat", "group:1")
+        eq(gate.check(dcfg, "海阔天空", "group:1")["ok"], True, "本群那首歌的「刚下过」被清掉")
+        gate.reset("all")
+        gate.commit(dcfg, "海阔天空", "group:1")
+        gate.commit(dcfg, "晴天", "group:1")
+        eq(gate.check(dcfg, "随便一首", "group:2")["ok"], False, "别的群仍受全局每小时额度约束")
         module._engine.config = config
 
         print("· 卸载")

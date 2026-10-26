@@ -382,14 +382,22 @@ class FakeCfg:
 
 
 class FakeClient:
-    def __init__(self, songs, rate_limited=False):
+    def __init__(self, songs, rate_limited=False, risk_limited=False):
         self.songs = songs
         self.rate_limited = rate_limited
+        self.risk_limited = risk_limited
         self.calls = 0
         self.downloaded = []
 
     async def search_songs(self, keyword, *, limit=5, timeout_sec=12.0):
         self.calls += 1
+        if self.risk_limited:
+            return {
+                "ok": False,
+                "rate_limited": True,
+                "risk_limited": True,
+                "error": "网易云触发了风控（-460），已暂停 5 分钟",
+            }
         if self.rate_limited:
             return {"ok": False, "rate_limited": True, "error": "限流"}
         return {"ok": True, "songs": self.songs, "endpoint": "fake"}
@@ -451,6 +459,13 @@ async def download_tests():
             fake.rate_limited = True
             result = await download.download_song(FakeCfg(), "海阔天空", empty_cache)
             truthy("限流" in (result.get("error") or ""), "限流与没结果分开报告", result)
+
+            # 风控冷却（-460）要保留原文案，不能被报成「连不上网易云」
+            fake.rate_limited = False
+            fake.risk_limited = True
+            result = await download.download_song(FakeCfg(), "海阔天空", empty_cache)
+            truthy("风控" in (result.get("error") or ""), "风控冷却与网络失败分开报告", result)
+            truthy(bool(result.get("risk_limited")), "把 risk_limited 往上带", result)
     finally:
         netease.search_songs, netease.song_url, netease.download_to = original
 
@@ -585,6 +600,157 @@ async def config_tests():
 
 
 asyncio.run(config_tests())
+
+# ───────────────────────────────────────────── 回归：1.9.3 修掉的问题
+
+
+def regression_tests():
+    print("· 回归：打分 / 候选裁剪 / 豁免 / 缓存 / ID3 / 登录态")
+
+    # ① 翻唱扣分必须走「分词分支」也生效（以前只有子串分支扣分）
+    cover = logic.score_candidate(
+        {"name": "晴天 (原唱 周杰伦) - RyaVocal", "title": "晴天 (原唱 周杰伦)", "artist": "RyaVocal"},
+        "晴天 周杰伦",
+    )
+    genuine = logic.score_candidate(
+        {"name": "晴天 - 周杰伦", "title": "晴天", "artist": "周杰伦"}, "晴天 周杰伦"
+    )
+    truthy(cover < logic.NET_MIN_SCORE, "翻唱在分词分支也被扣到闸下", cover)
+    truthy(cover < genuine, "正版仍然优先", (cover, genuine))
+    # 用户自己就在找 remix 时不能扣分
+    remix = logic.score_candidate(
+        {"name": "海阔天空 (DJ Remix) - 某某", "title": "海阔天空 (DJ Remix)", "artist": "某某"},
+        "海阔天空 remix",
+    )
+    truthy(remix >= logic.NET_MIN_SCORE, "点 remix 时不把 remix 当翻唱扣分", remix)
+
+    # ② 裁剪不能让「下载一份新的」失去可选项
+    many_locals = [
+        {"id": "file:/a{}.mp3".format(index), "name": "海阔天空 v{}".format(index), "source": "local", "score": 900}
+        for index in range(4)
+    ]
+    merged = logic.with_local_question(
+        many_locals
+        + [{"id": "123", "name": "海阔天空", "source": "netease", "score": 800}]
+    )["list"]
+    trimmed = logic.trim_choices(merged, 5)  # 本地 4 条 + 动作项正好占满，远程项被切掉
+    truthy(
+        not any(str(item.get("id")) == logic.DOWNLOAD_NEW_ID for item in trimmed),
+        "动作项后面没有远程项时，把动作项丢掉（不留死胡同）",
+        [item.get("name") for item in trimmed],
+    )
+    truthy(
+        any(item.get("source") == "netease" for item in trimmed),
+        "丢掉动作项之后远程项顶上来",
+        [item.get("source") for item in trimmed],
+    )
+    trimmed2 = logic.trim_choices(merged, 6)
+    has_action = any(str(item.get("id")) == logic.DOWNLOAD_NEW_ID for item in trimmed2)
+    has_remote = any(item.get("source") == "netease" for item in trimmed2)
+    truthy(not has_action or has_remote, "动作项留下时必带远程项", trimmed2)
+
+    # ③ 「全部会话」的豁免必须真的覆盖别的会话
+    clock = {"t": 1000.0}
+    exempt = logic.Exemptions(now=lambda: clock["t"])
+    exempt.grant("group:1", "u1", "all", 600)
+    truthy(exempt.check("group:9", "u2")["exempt"], "all 豁免覆盖别的会话", exempt.check("group:9", "u2"))
+    clock["t"] += 601
+    eq(exempt.check("group:9", "u2")["exempt"], False, "all 豁免到期")
+
+    # ④ TtlCache 在多线程下不能抛 RuntimeError
+    import threading
+
+    cache = logic.TtlCache(ttl_sec=60, max_size=64)
+    for index in range(64):
+        cache.set("warm-{}".format(index), index)
+    errors = []
+    stop = threading.Event()
+    old_switch = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)  # 放大窗口，竞态本身与它无关
+
+    def worker(tag):
+        index = 0
+        while not stop.is_set():
+            index += 1
+            try:
+                cache.get("{}-{}".format(tag, index))
+                cache.set("{}-{}".format(tag, index), index)
+            except Exception as exc:  # noqa: BLE001 - 就是要抓住它
+                errors.append("{}: {}".format(type(exc).__name__, exc))
+                stop.set()
+                return
+
+    threads = [threading.Thread(target=worker, args=("t{}".format(index),)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+    stop.set()
+    sys.setswitchinterval(old_switch)
+    eq(errors, [], "TtlCache 并发读写不抛异常")
+
+    # ⑤ ID3 扩展头（v2.3 / v2.4）不能把标签读丢
+    def synchsafe(value):
+        return bytes(
+            [
+                (value >> 21) & 0x7F,
+                (value >> 14) & 0x7F,
+                (value >> 7) & 0x7F,
+                value & 0x7F,
+            ]
+        )
+
+    def build_tag(major, extended):
+        title = b"\x03" + "海阔天空".encode("utf-8")
+        frame = (
+            b"TIT2"
+            + (synchsafe(len(title)) if major >= 4 else len(title).to_bytes(4, "big"))
+            + b"\x00\x00"
+            + title
+        )
+        ext = b""
+        if extended:
+            ext = (
+                b"\x00\x00\x00\x06" + b"\x01\x00"
+                if major >= 4
+                else b"\x00\x00\x00\x06" + b"\x00" * 6
+            )
+        body = ext + frame
+        flags = 0x40 if extended else 0x00
+        return b"ID3" + bytes([major, 0, flags]) + synchsafe(len(body)) + body
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp = Path(temp_dir)
+        for major in (3, 4):
+            for extended in (False, True):
+                path = temp / "t{}-{}.mp3".format(major, int(extended))
+                path.write_bytes(build_tag(major, extended) + b"\x00" * 200_000)
+                eq(
+                    library.read_audio_tags(str(path))["title"],
+                    "海阔天空",
+                    "ID3v2.{} 扩展头={} 也能读出标题".format(major, extended),
+                )
+
+        # ⑥ 登录态 JSON 里 saved_at 是脏数据时，load() 必须当作没登录（而不是抛异常）
+        login_store = _load("login_store")
+        broken = temp / "data"
+        broken.mkdir()
+        (broken / login_store.LOGIN_FILENAME).write_text(
+            '{"version": 1, "source": "qr", "saved_at": "昨天", "cookies": {"MUSIC_U": "abc"}}',
+            encoding="utf-8",
+        )
+        record = login_store.load(broken)
+        eq(record.get("saved_at"), 0.0, "脏 saved_at 归零而不是抛异常")
+        eq(record.get("cookies", {}).get("MUSIC_U"), "abc", "cookie 仍然读得出来")
+
+    # ⑦ 登录态 describe：MUSIC_U 不在第一个时不要误判「未登录」
+    login_store = _load("login_store")
+    login_store.set_current("__csrf=zzzzzzzz; MUSIC_U=abcdefgh", source="qr")
+    truthy(login_store.describe()["logged_in"], "describe 能认出第二个 cookie 里的 MUSIC_U")
+    login_store.set_current("", source="")
+
+
+regression_tests()
 
 # ───────────────────────────────────────────── 结果
 

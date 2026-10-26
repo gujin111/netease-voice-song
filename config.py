@@ -73,6 +73,13 @@ class VoiceSongConfig(BaseModel):
             "关 = 只认明确包含歌名的文件，更不容易放错歌。"
         ),
     )
+    library_public: bool = Field(
+        default=False,
+        description=(
+            "开 = 普通群友也能用 /vs-library 列出曲库文件名；"
+            "关（默认）= 只有管理员能看完整清单（文件名可能带私人信息），普通群友只看到数量。"
+        ),
+    )
 
     # ── 自动下载 ──
     enable_download: bool = Field(

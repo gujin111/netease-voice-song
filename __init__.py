@@ -73,7 +73,7 @@ from . import download, library, logic, netease, netease_login, login_store
 from .config import VoiceSongConfig
 
 PLUGIN_NAME = "netease-voice-song"
-PLUGIN_VERSION = "1.9.2"
+PLUGIN_VERSION = "1.9.3"
 
 #: 临时音频文件保留多久（协议端可能还在读，不能发完就删）
 TMP_KEEP_SEC = 15 * 60
@@ -202,43 +202,50 @@ class DownloadGate:
     为什么单独一套（不复用发送闸）：发送闸管的是「发消息频率」，
     这里管的是「往外网要文件的频率」—— 一个群反复点同一首歌时，
     真正该拦的是重复下载（缓存会命中，但第一次之外的失败重试会打爆对方接口）。
+
+    ⚠️ 记录**按会话分开**：管理员发「解除点歌限制 本群」时要清掉的只是本群那份，
+        不能顺手把其它群的每小时额度一起清零；反过来，本群那首歌的「刚下过」
+        也必须真的被清掉，否则那句「解除」对当事人等于没生效。
     """
 
     def __init__(self) -> None:
-        self._last_by_song: Dict[str, float] = {}
-        self._sent_at: List[float] = []
+        self._last_by_song: Dict[Tuple[str, str], float] = {}
+        self._sent_at: List[Dict[str, Any]] = []
 
-    def check(self, cfg: VoiceSongConfig, song: str) -> Dict[str, Any]:
+    def check(self, cfg: VoiceSongConfig, song: str, chat_key: str = "") -> Dict[str, Any]:
         current = _now()
-        self._sent_at = [at for at in self._sent_at if at > current - 3600]
+        self._sent_at = [item for item in self._sent_at if item["at"] > current - 3600]
         limit = int(cfg.download_per_hour or 0)
         if limit > 0 and len(self._sent_at) >= limit:
             return {"ok": False, "reason": "本小时下载已达上限（{} 首）".format(limit)}
         cooldown_min = int(cfg.download_cooldown_min or 0)
         if cooldown_min > 0:
-            key = logic.normalize_name(song)
+            key = (str(chat_key), logic.normalize_name(song))
             last = self._last_by_song.get(key)
             if last is not None and current - last < cooldown_min * 60:
                 left = math.ceil((cooldown_min * 60 - (current - last)) / 60)
                 return {"ok": False, "reason": "这首歌刚下过（{} 分钟后可重试）".format(left)}
         return {"ok": True}
 
-    def commit(self, cfg: VoiceSongConfig, song: str) -> None:
+    def commit(self, cfg: VoiceSongConfig, song: str, chat_key: str = "") -> None:
         current = _now()
-        self._sent_at.append(current)
+        self._sent_at.append({"chat": str(chat_key), "at": current})
         if len(self._last_by_song) > 500:
             cutoff = current - 86400
             for key in [key for key, at in self._last_by_song.items() if at < cutoff]:
                 self._last_by_song.pop(key, None)
         if int(cfg.download_cooldown_min or 0) > 0:
-            self._last_by_song[logic.normalize_name(song)] = current
+            self._last_by_song[(str(chat_key), logic.normalize_name(song))] = current
 
-    def reset(self, scope: str = "chat") -> None:
+    def reset(self, scope: str = "chat", chat_key: str = "") -> None:
+        key = str(chat_key)
         if scope == "all":
             self._last_by_song.clear()
             self._sent_at = []
         elif scope == "chat":
-            self._sent_at = []
+            self._sent_at = [item for item in self._sent_at if item["chat"] != key]
+            for song_key in [item for item in self._last_by_song if item[0] == key]:
+                self._last_by_song.pop(song_key, None)
 
 
 # ───────────────────────────────────────────── 引擎（运行时状态）
@@ -255,6 +262,9 @@ class LoginSession:
     requester: str
     #: 回消息用的发送器（命令路径/钩子路径各自包装，见 _Reply）
     sender: Any
+    #: 流程中攒到的 cookie（unikey / 历次轮询的 Set-Cookie）——
+    #: 只保存 803 那一次的话，登录态可能只剩 MUSIC_U，正是 -460 的诱因之一
+    cookies: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -413,6 +423,29 @@ def _copy_to_tmp(engine: Engine, source: str) -> Path:
     return target
 
 
+async def _sweep_tmp_async(engine: Engine, force: bool = False) -> int:
+    """``_sweep_tmp`` 的异步包装：目录遍历 + stat + unlink 都是同步 IO。"""
+    try:
+        return await asyncio.to_thread(_sweep_tmp, engine, force)
+    except Exception as exc:  # 清理失败不影响这次发送
+        _warn(engine, "清理临时文件失败（不影响点歌）：{}".format(exc))
+        return 0
+
+
+def _chat_lock(engine: Engine, chat_key: str) -> asyncio.Lock:
+    """取（或建）某个会话的串行锁。
+
+    ⚠️ 确定性点歌、选择回复、工具调用**三条**路径都要拿同一把锁：
+       以前只有 `_dispatch` 拿，模型走工具路径时可以和同群的另一首并发，
+       两首都通过了「冷却/配额」检查、都还没 commit —— 闸被穿透。
+    """
+    lock = engine.locks.get(chat_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        engine.locks[chat_key] = lock
+    return lock
+
+
 def _record_error(engine: Engine, message: str) -> None:
     engine.stats.errors += 1
     engine.stats.last_note = logic.cut(message, 200)
@@ -494,7 +527,29 @@ def _allow_download(engine: Engine, chat_key: str, sender_id: str, song: str) ->
     exemption = engine.exempt.check(chat_key, sender_id)
     if exemption.get("exempt"):
         return {"ok": True, "exempt": True}
-    return engine.download_gate.check(engine.config, song)
+    return engine.download_gate.check(engine.config, song, chat_key)
+
+
+def _max_send_bytes(engine: Engine) -> float:
+    return float(engine.config.max_file_mb or 20) * 1024 * 1024
+
+
+def _too_big_note(engine: Engine, size: Any, title: str = "") -> str:
+    """超过 ``max_file_mb`` 时的说明；没超过返回空串。
+
+    ⚠️ 这道闸必须在**所有**发送路径上都过一遍：`always_ask`（默认）时真正的发送
+       发生在 ``_handle_choice``，而那里以前没有任何大小检查 —— 于是默认配置下
+       ``max_file_mb`` 等于不存在，60MB 的 FLAC 也会被拷进临时目录再发。
+    """
+    try:
+        value = float(size or 0)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0 or value <= _max_send_bytes(engine):
+        return ""
+    return "《{}》有 {:.0f}MB，超过上限 {}MB，发不出来。".format(
+        title or "这首歌", value / 1048576.0, engine.config.max_file_mb
+    )
 
 
 # ───────────────────────────────────────────── 发送
@@ -660,20 +715,26 @@ async def _ask_for_choice(
 ) -> None:
     """把候选列表发出去，并记住「这个人在等选择」。"""
     cfg = engine.config
-    text = logic.format_choice_list(song, choices, max_items=int(cfg.max_choices or 8))
+    max_items = int(cfg.max_choices or 8)
+    choices = logic.trim_choices(choices, max_items)
+    text = logic.format_choice_list(song, choices, max_items=max_items)
+    # ⚠️ 顺序：**发送成功之后**才登记待选。
+    #    `_reply_quiet` 会把异常吞成一条日志，以前先 put 再发，于是列表没到群里、
+    #    待选却还在 —— 之后这个人回一个「2」会被当成选择，放一首他从没见过的歌。
     try:
-        engine.pending.put(
-            chat_key,
-            sender_id,
-            {"song": song, "choices": choices, "at": _now(), "ttl_sec": int(cfg.choice_ttl_sec or 180)},
-        )
-        await _reply_quiet(engine, ctx, conversation, text)
-        engine.stats.asked += 1
-        engine.stats.last_note = "等选择：{}（{} 首）".format(song, len(choices))
-        _log(engine, "{} 「{}」有 {} 个候选，已发出选择列表等回复".format(chat_key, song, len(choices)))
+        await ctx.send(conversation, text)
     except Exception as exc:
         _record_error(engine, "发送选择列表失败：{}".format(exc))
         _warn(engine, "{} 发送选择列表失败：{}".format(chat_key, exc))
+        return
+    engine.pending.put(
+        chat_key,
+        sender_id,
+        {"song": song, "choices": choices, "at": _now(), "ttl_sec": int(cfg.choice_ttl_sec or 180)},
+    )
+    engine.stats.asked += 1
+    engine.stats.last_note = "等选择：{}（{} 首）".format(song, len(choices))
+    _log(engine, "{} 「{}」有 {} 个候选，已发出选择列表等回复".format(chat_key, song, len(choices)))
 
 
 # ───────────────────────────────────────────── 主流程：点歌
@@ -715,24 +776,51 @@ async def _handle_song(
     # ⚠️ 开启「每次都先选」(always_ask) 时，**本地命中也必须走选择流程**：
     #    列表里会同时列出本地那首和网易云的各个版本，由点歌的人自己决定放哪个。
     #    所以这里先不挑本地命中。
-    best = None
-    if not (cfg.always_ask or not tagged):
-        best = logic.pick_best(tagged, song, fuzzy=cfg.fuzzy)
+    local_best = logic.pick_best(tagged, song, fuzzy=cfg.fuzzy) if tagged else None
+    best = None if cfg.always_ask else local_best
 
     # ── 本地没有（或开启「每次都先选」）→ 去网易云找 ──
     if best is None:
-        engine.stats.misses += 1
-        engine.stats.last_note = (
-            "曲库里没找到「{}」".format(song) if files else "音乐目录里没有音频文件"
-        )
+        if local_best is None:
+            # 只有「曲库里真的没有」才算 miss：always_ask 时我们只是按设置故意不挑，
+            # 本地明明有却被记成 miss，状态面板的数字会虚高。
+            engine.stats.misses += 1
+            engine.stats.last_note = (
+                "曲库里没找到「{}」".format(song) if files else "音乐目录里没有音频文件"
+            )
+        else:
+            engine.stats.last_note = "本地已有「{}」，按设置先列候选".format(song)
         if cfg.always_ask:
-            _log(engine, "{} 按设置先列候选（本地 {} 首 + 网易云）".format(chat_key, len(files)))
+            _log(
+                engine,
+                "{} 按设置先列候选（本地 {} 首{}）".format(
+                    chat_key, len(files), "" if cfg.enable_download else "，自动下载已关闭"
+                ),
+            )
         elif files:
             _log(engine, "{} 曲库 {} 首里没找到「{}」，转去网易云找".format(chat_key, len(files), song))
         else:
             _log(engine, "{} 曲库为空，转去网易云找「{}」".format(chat_key, song))
 
-        if not cfg.enable_download and not cfg.always_ask:
+        if not cfg.enable_download:
+            # 关掉自动下载 = 一条网都不联：这里既**不搜**网易云，也不列远程版本。
+            # 早先这道闸被 `and not cfg.always_ask` 限死，而 always_ask 默认是 true ——
+            # 于是「关掉自动下载」的人照样联网搜歌，回数字之后还真把歌下下来了。
+            # 「每次都先选」时把本地曲库/缓存里的候选列出来让人挑（列表文案会注明只有本地）。
+            local_only = (
+                download.collect_local_candidates(cfg, song, tagged) if cfg.always_ask else []
+            )
+            if local_only:
+                await _ask_for_choice(
+                    engine,
+                    ctx,
+                    conversation,
+                    chat_key=chat_key,
+                    sender_id=sender_id,
+                    song=song,
+                    choices=local_only,
+                )
+                return
             # 关掉下载时保持原来的行为：安静 + 可选提示
             if cfg.reply_on_failure:
                 has_ncm = False
@@ -811,7 +899,7 @@ async def _handle_song(
         if result.get("from_cache"):
             engine.stats.cache_hits += 1
         else:
-            engine.download_gate.commit(cfg, song)
+            engine.download_gate.commit(cfg, song, chat_key)
             engine.stats.downloads += 1
         engine.stats.last_download = "{}{}".format(
             result.get("title") or "", " — " + result["artist"] if result.get("artist") else ""
@@ -866,7 +954,7 @@ async def _handle_song(
     #    如果拷文件这一步就失败（磁盘满/权限/源文件被删），我们应该什么都没发出去，
     #    而不是让这条点歌静默消失。
     try:
-        _sweep_tmp(engine)
+        await _sweep_tmp_async(engine)
         tmp_path = await asyncio.to_thread(_copy_to_tmp, engine, str(hit["path"]))
     except Exception as exc:
         _record_error(engine, "准备临时文件失败：{}".format(exc))
@@ -924,9 +1012,29 @@ async def _handle_choice(
     if str(chosen.get("id")) == logic.DOWNLOAD_NEW_ID or chosen.get("source") == "action":
         remote = [item for item in choices if item.get("source") == "netease"]
         if not remote:
-            await _reply_quiet(
-                engine, ctx, conversation, "网易云那边这次没搜到别的版本，就用本地那份吧 —— 回数字重新选。"
-            )
+            # 待选已经被 take() 消费掉了，所以这里不能只回一句「回数字重新选」——
+            # 那句话之后什么都不会发生（死胡同）。把本地那几份重新列一次，状态也就恢复了。
+            local_again = [item for item in choices if item.get("source") == "local"]
+            if local_again:
+                await _ask_for_choice(
+                    engine,
+                    ctx,
+                    conversation,
+                    chat_key=chat_key,
+                    sender_id=sender_id,
+                    song=pending.get("song") or "",
+                    choices=local_again,
+                )
+                await _reply_quiet(
+                    engine, ctx, conversation, "网易云那边这次没搜到别的版本，先列本地的给你挑。"
+                )
+            else:
+                await _reply_quiet(
+                    engine,
+                    ctx,
+                    conversation,
+                    "网易云那边这次没搜到别的版本，也没有本地副本 —— 重新发一次「点歌 歌名」试试。",
+                )
             return
         await _ask_for_choice(
             engine,
@@ -950,6 +1058,21 @@ async def _handle_choice(
         ),
     )
 
+    # 选中的是**本地/缓存文件**（候选来自缓存目录，没有网易云 id）→ 直接发这个文件，不用下载
+    local_file = chosen.get("file_path") or ""
+    if not local_file and str(chosen.get("id") or "").startswith("file:"):
+        local_file = str(chosen["id"])[5:]
+
+    # 「自动下载」关掉时，选择列表里本来就不该有远程项；万一有（旧列表 / 配置刚改），
+    # 也不能在这里悄悄下下来 —— 用户关掉的开关必须真的算数。
+    if not local_file and not cfg.enable_download:
+        engine.stats.skipped += 1
+        engine.stats.last_note = "自动下载已关闭"
+        _log(engine, "{} 选中的是网易云版本，但自动下载已关闭，拒绝下载".format(chat_key))
+        if cfg.reply_on_failure:
+            await _reply_quiet(engine, ctx, conversation, "自动下载关着，只能放本地已有的歌。")
+        return
+
     # 发送闸（放歌这一步照旧受限流约束；管理员解除限制后豁免）
     gate = _allow_send(engine, chat_key, sender_id, chosen.get("name") or "")
     if not gate["ok"]:
@@ -960,13 +1083,21 @@ async def _handle_choice(
             await _reply_quiet(engine, ctx, conversation, "这次没发：{}。".format(gate["reason"]))
         return
 
-    # 选中的是**本地/缓存文件**（候选来自缓存目录，没有网易云 id）→ 直接发这个文件，不用下载
-    local_file = chosen.get("file_path") or ""
-    if not local_file and str(chosen.get("id") or "").startswith("file:"):
-        local_file = str(chosen["id"])[5:]
     if local_file:
         try:
-            _sweep_tmp(engine)
+            size = (await asyncio.to_thread(Path(local_file).stat)).st_size
+        except OSError:
+            size = 0
+        too_big = _too_big_note(engine, size, chosen.get("name") or "")
+        if too_big:
+            engine.stats.skipped += 1
+            engine.stats.last_note = too_big
+            _log(engine, "{} 选中的文件太大：{}".format(chat_key, too_big))
+            if cfg.reply_on_failure:
+                await _reply_quiet(engine, ctx, conversation, too_big)
+            return
+        try:
+            await _sweep_tmp_async(engine)
             tmp_path = await asyncio.to_thread(_copy_to_tmp, engine, local_file)
         except Exception as exc:
             _record_error(engine, "发送所选文件失败：{}".format(exc))
@@ -1022,7 +1153,16 @@ async def _handle_choice(
             )
         return
 
-    engine.download_gate.commit(cfg, chosen.get("name") or "")
+    too_big = _too_big_note(engine, result.get("bytes"), chosen.get("name") or "")
+    if too_big:
+        engine.stats.skipped += 1
+        engine.stats.last_note = too_big
+        _log(engine, "{} 下下来的文件太大：{}".format(chat_key, too_big))
+        if cfg.reply_on_failure:
+            await _reply_quiet(engine, ctx, conversation, too_big)
+        return
+
+    engine.download_gate.commit(cfg, chosen.get("name") or "", chat_key)
     engine.stats.downloads += 1
     engine.stats.last_download = "{}{}".format(
         chosen.get("name") or "", " — " + chosen["artist"] if chosen.get("artist") else ""
@@ -1032,7 +1172,7 @@ async def _handle_choice(
     engine.index_cache.clear()
 
     try:
-        _sweep_tmp(engine)
+        await _sweep_tmp_async(engine)
         tmp_path = await asyncio.to_thread(_copy_to_tmp, engine, str(result["path"]))
     except Exception as exc:
         _record_error(engine, "发送所选的歌失败：{}".format(exc))
@@ -1106,9 +1246,10 @@ async def _handle_unlock(
     # ① 清记录
     reset_scope = "all" if scope == "all" else ("user" if scope in ("self", "user") else "chat")
     wiped = engine.gate.reset(chat_key, target_id, reset_scope)
-    # 下载闸也一起放行：否则「解除了限制」却仍被「这首歌刚下过」拦住，用户会觉得没生效
+    # 下载闸也一起放行：否则「解除了限制」却仍被「这首歌刚下过」拦住，用户会觉得没生效。
+    # 只清本会话那份记录 —— 别顺手把其它群的每小时下载额度也清零。
     if scope in ("all", "chat"):
-        engine.download_gate.reset(scope)
+        engine.download_gate.reset(scope, chat_key)
 
     # ② 可选：开一段时间的「不限制」
     #    scope=chat 时豁免整个会话；scope=self/user 时只豁免当事人。
@@ -1236,14 +1377,30 @@ async def _start_login(engine: Engine, sender: _Reply, *, requester: str, chat_k
         )
         return
 
+    timeout_sec = max(30.0, float(engine.config.login_qr_timeout_sec or 180))
+    # ⚠️ 先占位、再 await：从「检查有没有在跑」到「把 session 放进 engine.login」
+    #    中间要 await 发提示、申请 unikey、发二维码图片 —— 两个群同时发 /vs-login 时
+    #    足够让两路都通过检查；后赋值的会把前一路的轮询顶掉，
+    #    那个群的二维码还印在屏幕上，但永远没人轮询（扫了没反应）。
+    placeholder = LoginSession(
+        key="",
+        started_at=_now(),
+        timeout_sec=timeout_sec,
+        chat_key=chat_key,
+        requester=requester,
+        sender=sender,
+    )
+    engine.login = placeholder
+
     await sender.text("正在向网易云申请登录二维码…")
     result = await netease_login.request_unikey()
     if not result.get("ok"):
+        if engine.login is placeholder:
+            engine.login = None
         await sender.text("生成二维码失败：{}".format(logic.cut(result.get("error"), 160)))
         return
 
     url = str(result.get("url") or "")
-    timeout_sec = max(30.0, float(engine.config.login_qr_timeout_sec or 180))
     png = netease_login.make_qr_png(url)
     sent_image = (await sender.image(png, "netease-login.png")) if png else False
 
@@ -1259,7 +1416,13 @@ async def _start_login(engine: Engine, sender: _Reply, *, requester: str, chat_k
         chat_key=chat_key,
         requester=requester,
         sender=sender,
+        cookies=netease_login.cookies_from_set_cookie(result.get("set_cookie")),
     )
+    if engine.login is not placeholder:
+        # 申请二维码/发图片这段时间里被「/vs-login 取消」或被别的流程顶掉了：
+        # 不要再把轮询挂起来（否则会在用户已经取消之后才开始等扫码）。
+        _log(engine, "{} 扫码登录在发起阶段被取消/顶替，不再轮询".format(chat_key))
+        return
     engine.login = session
     task = asyncio.create_task(_poll_login(engine, session))
     engine.tasks.add(task)
@@ -1283,14 +1446,18 @@ async def _poll_login(engine: Engine, session: LoginSession) -> None:
                 return  # 被取消，或被新的登录顶掉
             if _now() >= deadline:
                 break
-            result = await netease_login.poll_once(session.key)
+            result = await netease_login.poll_once(
+                session.key, cookie=netease_login.cookie_string(session.cookies)
+            )
+            # 把每次轮询拿到的 cookie 都攒起来：__csrf/NMTID 可能只在早期响应里下发
+            session.cookies.update(result.get("cookies") or {})
             state = str(result.get("state") or "")
             if state == netease_login.STATE_SCANNED and last_state != state:
                 await session.sender.text("👀 已扫码，请在手机上点「确认登录」…")
             last_state = state
 
             if state == netease_login.STATE_SUCCESS:
-                cookies = result.get("cookies") or {}
+                cookies = dict(session.cookies) or (result.get("cookies") or {})
                 saved = login_store.save(engine.data_dir, cookies, source="qr")
                 engine.login = None
                 note = (
@@ -1374,12 +1541,20 @@ def _natural_key(text: str) -> List[Tuple[int, Any]]:
 
 
 def _parse_library_args(raw: str) -> Tuple[str, int]:
-    """把 ``关键词 | 页码`` 拆开。``2`` / ``第2页`` / ``海阔 2`` 都认。"""
+    """把 ``关键词 | 页码`` 拆开。``2`` / ``第2页`` / ``海阔 2`` 都认。
+
+    ⚠️ 不带「页」时只认 1~3 位数字：``/vs-library 1987`` 是在找歌名/年份，
+       以前会被当成第 1987 页 —— 关键词被吃空，直接跳到最后一页。
+    """
     text = str(raw or "").strip()
     if not text:
         return "", 1
     page = 1
-    match = re.search(r"(?:第\s*)?(\d{1,4})\s*页?\s*$", text)
+    # 带「页」的写法不限位数（「第 2024 页」也没什么可争的）
+    match = re.search(r"(?:第\s*)?(\d{1,4})\s*页\s*$", text)
+    if match is None:
+        # 不带「页」：单独的「2」或「海阔天空 2」，最多三位
+        match = re.search(r"(?:^|\s)(\d{1,3})\s*$", text)
     if match is not None:
         page = max(1, int(match.group(1)))
         text = text[: match.start()].strip()
@@ -1498,8 +1673,13 @@ async def _render_status(engine: Engine, *, is_admin: bool) -> str:
     return text[:_CMD_MAX_CHARS]
 
 
-async def _render_library(engine: Engine, *, raw_args: str = "") -> str:
-    """``/vs-library`` 的正文：按文件名筛选、分页，只给当前页读 ID3 标签。"""
+async def _render_library(engine: Engine, *, raw_args: str = "", is_admin: bool = False) -> str:
+    """``/vs-library`` 的正文：按文件名筛选、分页，只给当前页读 ID3 标签。
+
+    ⚠️ 曲库清单 = 这台机器上的文件名（歌手、甚至「录音 2023-xx」这类私人信息）。
+       ``/vs-status`` 已经把「内部状态 → 群里可见」按管理员分档了，这里保持一致；
+       想让普通群友也能看，把配置 ``library_public`` 打开。
+    """
     roots = _scan_roots(engine)
     files = await _load_library(engine, roots)
     if not files:
@@ -1510,6 +1690,23 @@ async def _render_library(engine: Engine, *, raw_args: str = "") -> str:
         )
 
     keyword, page = _parse_library_args(raw_args)
+    if not is_admin and not bool(getattr(engine.config, "library_public", False)):
+        if keyword:
+            needle = logic.normalize_name(keyword)
+            matched = [
+                item
+                for item in files
+                if needle and needle in logic.normalize_name(logic.strip_ext(item.get("name") or ""))
+            ]
+            return (
+                "📚 曲库 {} 首（{} 个目录）｜文件名含「{}」的 {} 首。\n"
+                "曲库清单只对管理员开放；普通群友直接发「点歌 歌名」就行。"
+            ).format(len(files), len(roots), logic.cut(keyword, 20), len(matched))
+        return (
+            "📚 曲库 {} 首（{} 个目录）。\n"
+            "曲库清单只对管理员开放；普通群友直接发「点歌 歌名」就行。"
+        ).format(len(files), len(roots))
+
     items = files
     if keyword:
         needle = logic.normalize_name(keyword)
@@ -1575,7 +1772,7 @@ def _render_help(engine: Engine, *, is_admin: bool) -> str:
         "【其它指令：英文 vs-* 命名空间（和歌名不会混）】",
         "  /vs-help                这一屏说明（简写 /vs）",
         "  /vs-status              登录态 + 曲库规模 + 限流与风控",
-        "  /vs-library [关键词] [页码]  曲库清单：筛选 / 翻页（每页 20 首）",
+        "  /vs-library [关键词] [页码]  曲库清单：筛选 / 翻页（每页 20 首，管理员）",
         "  /vs-login [取消]        手机扫码登录网易云（管理员）",
         "  /vs-logout              退出网易云登录（管理员）",
         "",
@@ -1586,7 +1783,7 @@ def _render_help(engine: Engine, *, is_admin: bool) -> str:
         "示例：/vs-library 周杰伦  →  /vs-library 2  →  /点歌 稻香",
         "",
         "为什么不用「/点歌登录」这种名字：它会和「点一首叫《登录》的歌」分不开。",
-        "旧的 /点歌状态、/点歌登录 等已停用，发出来会提示改用哪个 /vs-* 指令。",
+        "旧的 /点歌帮助、/点歌状态、/点歌登录 仍可用（自动转成对应 /vs-*，不会再被当成歌名）。",
         "",
         "全程 0 token：点歌与指令都不经过模型",
     ]
@@ -1595,8 +1792,13 @@ def _render_help(engine: Engine, *, is_admin: bool) -> str:
     return "\n".join(lines)[:_CMD_MAX_CHARS]
 
 
-def _command_help(command_ctx: Any) -> str:
-    """``/vs-help``（命令管线路径）。"""
+async def _command_help(command_ctx: Any) -> str:
+    """``/vs-help``（命令管线路径）。
+
+    ⚠️ 必须是 async：宿主是 ``await handler(...)`` 调命令处理器的，同步函数会直接抛
+       ``object str can't be used in 'await' expression`` —— 也就是「/点歌帮助 执行失败」
+       那类报错的来源。所有注册进命令表的手柄都必须是协程函数。
+    """
     engine = _engine
     if engine is None:
         return "点歌插件还没准备好，稍后再试。"
@@ -1610,21 +1812,44 @@ def _command_base_name(name: str) -> str:
     return name
 
 
-async def _handle_command(
-    engine: Engine, ctx: Any, event: Dict[str, Any], conversation: Any, chat_key: str
+def _rename_note(old: str, target: str) -> str:
+    """旧指令名照常执行时附的一句说明（不改结果，只告诉用户新名字）。"""
+    return (
+        "（「/{old}」是旧指令名，已改名为「/{target}」。点歌只负责放歌，"
+        "这类命令统一放在 vs- 命名空间下；这次先按你的意思执行。）"
+    ).format(old=old, target=target)
+
+
+async def _run_command(
+    engine: Engine,
+    ctx: Any,
+    event: Dict[str, Any],
+    conversation: Any,
+    chat_key: str,
+    base: str,
+    raw_args: str,
+    *,
+    note: str = "",
 ) -> None:
-    """群里没 @ 机器人时的指令兜底（命令管线不会接管，插件自己回）。"""
-    name, raw_args = _parse_command(Message(event).text)
-    base = _command_base_name(name)
+    """按名字执行一条 ``vs-*`` 指令。
+
+    两条入口共用它：``_handle_command``（群里没 @ 机器人时的兜底）与旧指令名
+    （``/点歌帮助``、``/点歌登录`` 这类）—— 后者**真的执行**，而不是只回一句
+    「改名了」，所以按老习惯发的命令不会再被当成「点一首叫《帮助》的歌」。
+    """
+    if note:
+        await _reply_quiet(engine, ctx, conversation, note)
+    sender_id = _sender_id(event)
     if base in (COMMAND_STATUS, *COMMAND_STATUS_ALIASES):
-        text = await _render_status(engine, is_admin=_is_admin(engine, _sender_id(event)))
+        text = await _render_status(engine, is_admin=_is_admin(engine, sender_id))
     elif base in (COMMAND_LIBRARY, *COMMAND_LIBRARY_ALIASES):
-        text = await _render_library(engine, raw_args=raw_args)
+        text = await _render_library(
+            engine, raw_args=raw_args, is_admin=_is_admin(engine, sender_id)
+        )
     elif base in (COMMAND_HELP, *COMMAND_HELP_ALIASES):
-        text = _render_help(engine, is_admin=_is_admin(engine, _sender_id(event)))
+        text = _render_help(engine, is_admin=_is_admin(engine, sender_id))
     elif base in (COMMAND_LOGIN, *COMMAND_LOGIN_ALIASES):
-        requester = _sender_id(event)
-        if not _is_admin(engine, requester):
+        if not _is_admin(engine, sender_id):
             await _reply_quiet(
                 engine, ctx, conversation, "扫码登录会拿到整个网易云账号的登录态，只允许管理员操作。"
             )
@@ -1636,13 +1861,12 @@ async def _handle_command(
         await _start_login(
             engine,
             _hook_sender(engine, ctx, conversation),
-            requester=requester,
+            requester=sender_id,
             chat_key=chat_key,
         )
         return
     elif base in (COMMAND_LOGOUT, *COMMAND_LOGOUT_ALIASES):
-        requester = _sender_id(event)
-        if not _is_admin(engine, requester):
+        if not _is_admin(engine, sender_id):
             await _reply_quiet(engine, ctx, conversation, "退出登录只允许管理员操作。")
             return
         await _cancel_login(engine)
@@ -1652,6 +1876,16 @@ async def _handle_command(
     else:
         return
     await _reply_quiet(engine, ctx, conversation, text)
+
+
+async def _handle_command(
+    engine: Engine, ctx: Any, event: Dict[str, Any], conversation: Any, chat_key: str
+) -> None:
+    """群里没 @ 机器人时的指令兜底（命令管线不会接管，插件自己回）。"""
+    name, raw_args = _parse_command(Message(event).text)
+    await _run_command(
+        engine, ctx, event, conversation, chat_key, _command_base_name(name), raw_args
+    )
 
 
 async def _command_status(command_ctx: Any) -> str:
@@ -1668,8 +1902,11 @@ async def _command_library(command_ctx: Any) -> str:
     engine = _engine
     if engine is None:
         return "点歌插件还没准备好，稍后再试。"
+    user_id = str(getattr(command_ctx, "user_id", "") or "")
     return await _render_library(
-        engine, raw_args=str(getattr(command_ctx, "raw_args", "") or "")
+        engine,
+        raw_args=str(getattr(command_ctx, "raw_args", "") or ""),
+        is_admin=_is_admin(engine, user_id),
     )
 
 
@@ -1760,25 +1997,21 @@ def _register_commands(ctx: Any) -> None:
 # ───────────────────────────────────────────── 接管判定（同步、零 IO）
 
 
-def _legacy_command_target(text: str) -> str:
-    """``/点歌登录`` 这类**旧指令名** → 现在该用的 ``/vs-*``；不是旧指令返回空串。
+def _legacy_command_parts(text: str) -> Tuple[str, str]:
+    """``/点歌登录`` 这类旧名 → (该用的 vs-* 名字, 后面的参数)；不是旧指令返回 ("", 原文)。
 
     ⚠️ 只认「斜杠 + 一个旧名字」这种形态，**不认带空格的**「/点歌 状态」——
        后者是真·点歌请求（歌名就叫「状态」），不能抢。
     """
-    name, _ = _parse_command(text)
+    name, args = _parse_command(text)
     if not name:
-        return ""
-    return _LEGACY_COMMAND_MAP.get(name, "")
+        return "", args
+    return _LEGACY_COMMAND_MAP.get(name, ""), args
 
 
-def _render_legacy_hint(target: str) -> str:
-    return (
-        "「/点歌登录」这类旧指令已经改名了 —— 它原来会和「点一首叫《登录》的歌」分不开。\n"
-        "按你的意思，这次应该用：/{}\n\n"
-        "现在全部指令：/vs-help · /vs-status · /vs-library · /vs-login · /vs-logout\n"
-        "点歌本身没变：直接发「点歌 歌名」，或 /点歌 歌名。".format(target)
-    )
+def _legacy_command_target(text: str) -> str:
+    """旧指令名 → 现在该用的 ``vs-*``；不是旧指令返回空串。"""
+    return _legacy_command_parts(text)[0]
 
 
 def _parse_command(text: str) -> Tuple[str, str]:
@@ -1966,10 +2199,7 @@ def _dispatch(engine: Engine, kind: str, ctx: Any, event: Dict[str, Any]) -> Non
         except Exception as exc:
             _warn(engine, "无法从事件推断会话，本次不处理：{}".format(exc))
             return
-        lock = engine.locks.get(chat_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            engine.locks[chat_key] = lock
+        lock = _chat_lock(engine, chat_key)
         async with lock:
             if kind == "unlock":
                 await _handle_unlock(engine, ctx, event, conversation, chat_key)
@@ -1978,11 +2208,22 @@ def _dispatch(engine: Engine, kind: str, ctx: Any, event: Dict[str, Any]) -> Non
             elif kind == "cmd":
                 await _handle_command(engine, ctx, event, conversation, chat_key)
             elif kind == "moved":
-                await _reply_quiet(
+                old_name, _ = _parse_command(Message(event).text)
+                target, legacy_args = _legacy_command_parts(Message(event).text)
+                if not target:
+                    return
+                # 旧名字**照常执行**（不是只回一句「改名了」）：这样 /点歌帮助、/点歌登录
+                # 不会再变成「点一首叫《帮助》/《登录》的歌」，也不会因为宿主那边
+                # 注册过同名指令而报「object str can't be used in 'await' expression」。
+                await _run_command(
                     engine,
                     ctx,
+                    event,
                     conversation,
-                    _render_legacy_hint(_legacy_command_target(Message(event).text)),
+                    chat_key,
+                    target,
+                    legacy_args,
+                    note=_rename_note(old_name, target),
                 )
             else:
                 await _handle_song(engine, ctx, event, conversation, chat_key)
@@ -2143,6 +2384,23 @@ async def _tool_play_local_song(
             "那条消息由插件自己接管，不需要工具。"
         )
 
+    # ⚠️ 工具路径也要拿**会话锁**：`_dispatch` 里的确定性点歌、选择回复都拿同一把锁，
+    #    以前工具不拿，于是同群「一条点歌正在下载」+「模型这一轮又调工具」会并行，
+    #    两首都通过冷却/配额检查、都还没 commit —— 闸被穿透。
+    async with _chat_lock(engine, target_key):
+        return await _tool_play_locked(engine, ctx, conversation, target_key, asker_id, song_text)
+
+
+async def _tool_play_locked(
+    engine: Engine,
+    ctx: Any,
+    conversation: Any,
+    target_key: str,
+    asker_id: str,
+    song_text: str,
+) -> str:
+    """工具路径真正的工作，由 ``_tool_play_local_song`` 在会话锁里调用。"""
+    cfg = engine.config
     # 一轮最多放一首：模型曾经在一轮里连放三首（它自己都说「点串了」）。
     # 提示词里已经写明，但提示词挡不住的时候得靠代码挡。
     last_play = engine.turn_plays.get(target_key)
@@ -2216,7 +2474,7 @@ async def _tool_play_local_song(
         if result.get("from_cache"):
             engine.stats.cache_hits += 1
         else:
-            engine.download_gate.commit(cfg, song_text)
+            engine.download_gate.commit(cfg, song_text, target_key)
             engine.stats.downloads += 1
         engine.stats.last_download = "{}{}".format(
             result.get("title") or "", " — " + result["artist"] if result.get("artist") else ""
@@ -2241,7 +2499,7 @@ async def _tool_play_local_song(
         return "找到了「{}」但超过 {}MB，太大了发不出来。".format(hit.get("name"), cfg.max_file_mb)
 
     try:
-        _sweep_tmp(engine)
+        await _sweep_tmp_async(engine)
         tmp_path = await asyncio.to_thread(_copy_to_tmp, engine, str(hit["path"]))
     except Exception as exc:
         _record_error(engine, "工具发送失败（准备临时文件）：{}".format(exc))
@@ -2458,7 +2716,13 @@ async def _on_load(ctx: Any, config: VoiceSongConfig, logger: Any) -> None:
     # 请求节流是「降风控」的第一道闸，按配置生效
     netease.set_min_interval(cfg.netease_min_interval_sec)
     # 上次扫码登录的结果落在这里；没有就等用户发 /vs-login
-    saved_login = login_store.bootstrap(engine.data_dir)
+    # ⚠️ 登录态文件坏掉（手改过、旧格式、写了一半）不该拖垮整个插件：
+    #    bootstrap 里虽然已经做了字段级防护，这里再兜一层 —— 顶多是「要重新扫码」。
+    try:
+        saved_login = login_store.bootstrap(engine.data_dir)
+    except Exception as exc:
+        saved_login = None
+        _warn(engine, "读取已保存的网易云登录态失败（按未登录处理）：{}".format(exc))
     if saved_login:
         logger.info(
             "网易云登录态：已载入扫码保存的登录（{}）".format(
@@ -2500,7 +2764,7 @@ async def _on_startup() -> None:
     if engine is None:
         return
     try:
-        removed = _sweep_tmp(engine, force=True)
+        removed = await _sweep_tmp_async(engine, force=True)
         if removed:
             _log(engine, "启动清理：删掉 {} 个上次残留的临时音频".format(removed))
     except Exception:
@@ -2529,7 +2793,7 @@ async def _on_shutdown() -> None:
             pass
     engine.tasks.clear()
     try:
-        _sweep_tmp(engine, force=True)
+        await _sweep_tmp_async(engine, force=True)
     except Exception:
         pass
     engine.index_cache.clear()

@@ -48,13 +48,20 @@ async def search_with_fallback(cfg: Any, wanted: str, log: Logger = _noop) -> Di
     last_found: Optional[Dict[str, Any]] = None
     saw_request_failure = False
     saw_rate_limit = False
+    saw_risk = False
+    risk_error = ""
 
     for keyword in variants:
         found = await netease.search_songs(keyword, limit=limit)
         if not found.get("ok"):
-            # 三类失败要分开：限流 / 连不上 / 真的没结果。
+            # 四类失败要分开：风控冷却 / 接口限流 / 连不上 / 真的没结果。
             # 早先混成一句「没搜到」，结果「接口限流」看起来像「这首歌不存在」。
-            if found.get("rate_limited"):
+            if found.get("risk_limited"):
+                # -460 的全局冷却：这时候再换写法重试只会把冷却续长，必须原样报给用户
+                saw_risk = True
+                risk_error = str(found.get("error") or "")
+                attempts.append("{}（风控冷却）".format(keyword))
+            elif found.get("rate_limited"):
                 saw_rate_limit = True
                 attempts.append("{}（接口限流）".format(keyword))
             elif found.get("request_failed"):
@@ -96,6 +103,15 @@ async def search_with_fallback(cfg: Any, wanted: str, log: Logger = _noop) -> Di
             }
 
     if last_found is None:
+        if saw_risk:
+            return {
+                "ok": False,
+                "rate_limited": True,
+                "risk_limited": True,
+                "error": risk_error
+                or "网易云正在风控冷却（-460），过几分钟再点；这期间反复重试只会把冷却续长",
+                "attempts": attempts,
+            }
         if saw_rate_limit and not saw_request_failure:
             return {
                 "ok": False,
@@ -170,6 +186,7 @@ async def song_choice_candidates(
     remote: List[Dict[str, Any]] = []
     remote_error = ""
     rate_limited = False
+    risk_limited = False
     try:
         searched = await search_with_fallback(cfg, wanted, log)
         if searched.get("ok"):
@@ -178,6 +195,7 @@ async def song_choice_candidates(
         else:
             remote_error = searched.get("error", "")
             rate_limited = bool(searched.get("rate_limited"))
+            risk_limited = bool(searched.get("risk_limited"))
     except Exception as exc:
         remote_error = "搜索异常：{}".format(exc)
 
@@ -235,13 +253,15 @@ async def song_choice_candidates(
         return {
             "ok": False,
             "rate_limited": rate_limited,
+            "risk_limited": risk_limited,
             "searched": bool(remote_error),
             "error": remote_error or "没找到「{}」（本地和网易云都没有）".format(wanted),
         }
+    trimmed = logic.trim_choices(merged["list"], max_choices)
     return {
         "ok": True,
-        "choices": merged["list"][:max_choices],
-        "truncated": len(merged["list"]) > max_choices,
+        "choices": trimmed,
+        "truncated": len(trimmed) < len(merged["list"]),
         "total": len(merged["list"]),
         "asked_local": merged["asked_local"],
     }
@@ -307,9 +327,18 @@ async def _download_chosen(
         }
 
     ext = "flac" if getattr(cfg, "quality_key", "exhigh") == "lossless" else "mp3"
-    base = netease.safe_file_name(
-        "{} [{}]".format(chosen.get("name") or "song", chosen.get("id")), 90
-    )
+    # 文件名带上歌手：缓存去重是按「去掉 [id] 之后的名字」分组的，不带歌手时，
+    # 两首同名、不同歌手、时长只差 1~2 秒的歌会被判成重复、删掉其中一首。
+    # 先截「歌名 - 歌手」再拼 [id]，保证 id 尾巴（去重的凭据）不会被截断。
+    title_part = " - ".join(
+        part
+        for part in (
+            str(chosen.get("name") or "").strip(),
+            str(chosen.get("artist") or "").strip(),
+        )
+        if part
+    ) or "song"
+    base = "{} [{}]".format(netease.safe_file_name(title_part, 80), chosen.get("id"))
     destination = Path(download_dir) / "{}.{}".format(base, ext)
     downloaded = await netease.download_to(
         url_result["url"],
@@ -369,6 +398,10 @@ async def download_song(
     wanted = str(song or "").strip()
     if not wanted:
         return {"ok": False, "error": "歌名是空的"}
+    # 「自动下载」关掉时，这一层也要拦住：面板上的开关不能只对某一条入口生效，
+    # 否则用户在设置里关掉它，插件照样联网搜歌、照样下载（配置项形同虚设）。
+    if not bool(getattr(cfg, "enable_download", True)) and not str(pick or "").startswith("file:"):
+        return {"ok": False, "error": "自动下载已关闭（只发本地已有的歌）"}
     if not str(download_dir or "").strip():
         return {"ok": False, "error": "没有配置下载目录"}
     directory = Path(download_dir)
@@ -457,7 +490,9 @@ async def download_song(
     #      结果是永远先联网（缓存优化形同虚设）。
     if bool(getattr(cfg, "reuse_downloaded", True)):
         tokens = logic.tokens_of(wanted)
-        for cached in netease.list_cached(directory):
+        # 列目录也是同步 IO（最多 500 条 stat），别放在事件循环上
+        cached_files = await asyncio.to_thread(netease.list_cached, directory)
+        for cached in cached_files:
             score = logic.score_candidate(
                 dict(cached, title="", artist=""), wanted, fuzzy=bool(cfg.fuzzy), tokens=tokens
             )
@@ -512,6 +547,7 @@ async def download_song(
                 "ok": False,
                 "error": gathered.get("error"),
                 "rate_limited": gathered.get("rate_limited"),
+                "risk_limited": gathered.get("risk_limited"),
                 "searched": gathered.get("searched"),
             }
 
@@ -548,6 +584,9 @@ async def download_song(
     if always_ask or ambiguous:
         max_choices = max(1, min(20, int(getattr(cfg, "max_choices", 8) or 8)))
         shaped = logic.with_local_question(eligible)  # 唯一实现：本地有 → 插一条「下载一份新的」
+        # ⚠️ 裁剪要保证动作项后面还有远程项，否则用户选「下载一份新的」会拿到空列表
+        #    （而那时待选已经被消费掉了）→ 见 logic.trim_choices。
+        trimmed = logic.trim_choices(shaped["list"], max_choices)
         return {
             "ok": True,
             "need_choice": True,
@@ -566,7 +605,7 @@ async def download_song(
                     "source": item.get("source") or "netease",
                     "score": item.get("score"),
                 }
-                for item in shaped["list"][:max_choices]
+                for item in trimmed
             ],
         }
 

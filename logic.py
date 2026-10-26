@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Pattern, Sequence, Tuple
 
@@ -155,7 +156,12 @@ def parse_song_request(
     song = re.sub(r"^\s*[，,。.、:：!！~～\-—]+", "", song)
     song = re.sub(r"^[的《》「」『』\"'“”‘’\s]+", "", song)
     song = re.sub(r"[《》「」『』\"'“”‘’\s]+$", "", song)
-    song = re.sub(r"(?:这首歌|那首歌|一下|吧|呗|谢谢|蟹蟹|好不好|行不行)\s*$", "", song)
+    # 语气词尾巴可能叠着说（「海阔天空 吧 谢谢」）：剥一次之后再看看还有没有，
+    # 只剥一层的话会把「吧」带进搜索词，分词/包含判定都会变差。
+    previous = None
+    while previous != song:
+        previous = song
+        song = re.sub(r"(?:这首歌|那首歌|一下|吧|呗|谢谢|蟹蟹|好不好|行不行)\s*$", "", song)
     return {"hit": True, "song": cut(song.strip(), 80), "matched": match.group(0)}
 
 
@@ -203,8 +209,15 @@ _COVER_WORDS = (
 )
 
 
+def _has_cover_word(text: str) -> bool:
+    return any(word in text for word in _COVER_WORDS)
+
+
 def _artist_bias(title: str, artist: str, file: str, song: str, tokens: Any) -> int:
-    """歌手偏置：用户写了歌手名时，「歌手对得上」加分，「翻唱/伴奏」扣分。
+    """歌手偏置：用户写了歌手名时，「歌手对得上」加分，「歌手对不上」轻微扣分。
+
+    这里只管「歌手」这一件事 —— 「翻唱/伴奏/原唱」的扣分在 ``_cover_penalty`` 里，
+    因为它必须在每一条打分分支上都生效（见那个函数的说明）。
 
     真实故障：用户点「晴天 周杰伦」，下到的是「晴天 (原唱 周杰伦)」— RyaVocal ——
     那是翻唱，标题里恰好带着「原唱 周杰伦」，把所有分词都命中了，于是排到正版前面。
@@ -215,7 +228,6 @@ def _artist_bias(title: str, artist: str, file: str, song: str, tokens: Any) -> 
         return 0
     hay_title = normalize_name(title or file)
     hay_artist = normalize_name(artist)
-    everything = (hay_title + " " + hay_artist).strip()
 
     token_list = tokens if isinstance(tokens, list) else tokens_of(song)
     name_tokens = tokens_of(title or file)
@@ -232,11 +244,29 @@ def _artist_bias(title: str, artist: str, file: str, song: str, tokens: Any) -> 
         else:
             # 歌手对不上：轻微扣分，但不至于一票否决（可能是别名/多歌手）
             bias -= 60
-    if any(word in everything for word in _COVER_WORDS):
-        bias -= 200
-    if want_artists and not hay_artist and any(word in hay_title for word in _COVER_WORDS):
+    if want_artists and not hay_artist and _has_cover_word(hay_title):
         bias -= 100
     return bias
+
+
+def _cover_penalty(query: str, title: str, artist: str, file_name: str) -> int:
+    """「原唱 / 翻唱 / 伴奏 / remix …」扣分，**每一条打分分支都要加**。
+
+    为什么单独拎出来：早先这段只在「query 出现在文件名 / 标题里」两个分支生效，
+    而「晴天 周杰伦」对「晴天 (原唱 周杰伦)」这类候选走的是**分词分支**
+    （带歌手的 query 不是标题的连续子串），扣分被整段跳过 —— 翻唱以 526 分
+    过了 ``match_min_score``（430）那道闸。后果不是「排第二」，而是正版不在
+    这一轮结果里时，把翻唱当正版下下来发进群。
+
+    用户自己就写了翻唱 / remix 这类词时不扣分，否则「点歌 海阔天空 remix」
+    会被自己扣死。
+    """
+    haystack = " ".join(part for part in (title, artist, file_name) if part)
+    if not haystack or not _has_cover_word(haystack):
+        return 0
+    if query and _has_cover_word(query):
+        return 0
+    return -200
 
 
 def score_candidate(candidate: Dict[str, Any], song: Any, *, fuzzy: bool = True, tokens: Any = None) -> int:
@@ -249,8 +279,11 @@ def score_candidate(candidate: Dict[str, Any], song: Any, *, fuzzy: bool = True,
     artist = normalize_name(candidate.get("artist"))
     haystack = (title + " " + artist + " " + file_name).strip()
 
-    def adjusted(score: int) -> int:
-        return score + _artist_bias(title, artist, file_name, query, tokens)
+    def adjusted(score: int, *, artist_bias: bool = True) -> int:
+        total = score + _cover_penalty(query, title, artist, file_name)
+        if artist_bias:
+            total += _artist_bias(title, artist, file_name, query, tokens)
+        return total
 
     if file_name == query:
         return 1000  # 文件名整串就是歌名
@@ -260,8 +293,10 @@ def score_candidate(candidate: Dict[str, Any], song: Any, *, fuzzy: bool = True,
         return adjusted(700 + round(len(query) / max(len(file_name), 1) * 190))
     if title and query in title:
         return adjusted(660 + round(len(query) / max(len(title), 1) * 190))
-    if query in haystack:  # 歌手/标题拼起来包含
-        return 560
+    if query in haystack:
+        # 只靠「歌名+歌手拼起来包含」判断不了歌手对不对（跨语言写法很常见：
+        # 「宇多田光」对应「宇多田ヒカル」），所以这里只加翻唱扣分、不加歌手偏置。
+        return adjusted(560, artist_bias=False)
 
     # 分词匹配（歌名带歌手、或文件名带歌手时）。
     token_list = tokens if isinstance(tokens, list) else tokens_of(song)
@@ -277,14 +312,14 @@ def score_candidate(candidate: Dict[str, Any], song: Any, *, fuzzy: bool = True,
     # 分数要随「命中比例」走，不能一刀切给 260 —— 用户写「One Last Kiss 宇多田光」，
     # 网易云返回歌手「宇多田ヒカル」，4 个 token 命中 3 个本该很确定。
     if ratio >= 0.6:
-        return round(260 + ratio * 260 + min(12, longest) * 2)
+        return adjusted(round(260 + ratio * 260 + min(12, longest) * 2), artist_bias=False)
 
     # 只命中部分 token 时**不能要求全中**：最长的那个命中词够长（>= 4）就认可。
     coverage = round(longest / max(len(haystack), 1) * 40)
     if longest >= 4:
-        return 480 + coverage
+        return adjusted(480 + coverage, artist_bias=False)
     if longest == 3:
-        return 310 + coverage
+        return adjusted(310 + coverage, artist_bias=False)
     return 0
 
 
@@ -371,6 +406,28 @@ def with_local_question(items: Any) -> Dict[str, Any]:
     return {"list": out, "asked_local": True}
 
 
+def trim_choices(items: Any, max_items: Any) -> List[Dict[str, Any]]:
+    """按上限裁剪候选，并保证「下载一份新的」后面还有远程项可挑。
+
+    为什么要单独一个函数：``with_local_question`` 插动作项的前提是「本地和远程都有」，
+    但裁剪发生在它之后 —— 本地候选一多，动作项就会被挤到最后一个位置、远程项全被切掉。
+    用户选了「下载一份新的」之后拿不到任何远程项（`_handle_choice` 只能回一句
+    「回数字重新选」，而此时待选已经被消费掉）→ 死胡同。
+    所以这里反过来：动作项若被留下、远程项却一个不剩，就把动作项丢掉。
+    """
+    source = [dict(item) for item in (items if isinstance(items, (list, tuple)) else [])]
+    try:
+        limit = max(1, int(max_items or 1))
+    except (TypeError, ValueError):
+        limit = 1
+    trimmed = source[:limit]
+    has_action = any(str(item.get("id")) == DOWNLOAD_NEW_ID for item in trimmed)
+    has_remote = any(item.get("source") not in ("local", "action") for item in trimmed)
+    if has_action and not has_remote:
+        trimmed = [item for item in source if str(item.get("id")) != DOWNLOAD_NEW_ID][:limit]
+    return trimmed
+
+
 # ───────────────────────────────────────────── 展示与选择回复
 
 
@@ -421,8 +478,12 @@ def format_choice_list(song: str, choices: Any, *, max_items: int = 8) -> str:
         : max(1, int(max_items or 8))
     ]
     has_local = any(item.get("source") == "local" for item in items)
-    if has_local:
+    has_action = any(str(item.get("id")) == DOWNLOAD_NEW_ID for item in items)
+    if has_local and has_action:
         head = "「{}」本机已经有，要放这一份还是下新的？（回数字选）".format(song)
+    elif has_local:
+        # 只列本地（例如「自动下载」关掉时）：不能说成「还是下新的」，那会让人以为有得下
+        head = "「{}」本机找到 {} 份，回数字选一个：".format(song, len(items))
     else:
         head = "「{}」找到 {} 首，回数字选一个：".format(song, len(items))
     lines = [head]
@@ -732,6 +793,8 @@ class Exemptions:
     三种作用域各自一张表，键是：
       chat → chat_key        self → chat_key|sender_id      user → 任意会话里的这个 QQ
     user 作用域不绑会话：管理员的意图是「这个人别再被拦了」。
+    **all 作用域是一张全局表**：指令说的是「所有会话」，那就必须真的对所有会话生效
+    —— 早先 all 只写当前会话的 `_chat`，回执却印着「所有会话 N 分钟内不再限制」。
     """
 
     def __init__(
@@ -742,6 +805,8 @@ class Exemptions:
         self._chat: Dict[str, float] = {}
         self._self: Dict[str, float] = {}
         self._user: Dict[str, float] = {}
+        #: 「全部会话」的全局豁免（单调时钟的到期时刻，0 = 没有）
+        self._global_until: float = 0.0
 
     def _prune(self) -> None:
         current = self._now()
@@ -754,6 +819,8 @@ class Exemptions:
         self._prune()
         until = self._now() + max(0.0, float(duration_sec or 0))
         if scope == "all":
+            # 「所有会话」= 全局：任何会话、任何人都放行（回执上写的就是这个意思）
+            self._global_until = max(self._global_until, until)
             self._chat[str(chat_key)] = until
             if sender_id:
                 self._self["{}|{}".format(chat_key, sender_id)] = until
@@ -773,6 +840,10 @@ class Exemptions:
         """这个人在这个会话里是否被豁免。"""
         current = self._now()
         key = str(chat_key)
+        if self._global_until > current:
+            return {"exempt": True, "until": self._global_until, "scope": "all"}
+        if self._global_until:
+            self._global_until = 0.0
         until = self._chat.get(key)
         if until is not None:
             if until > current:
@@ -794,6 +865,9 @@ class Exemptions:
     def revoke(self, chat_key: str, sender_id: str = "", scope: str = "chat") -> int:
         key = str(chat_key)
         removed = 0
+        if scope == "all" and self._global_until > 0:
+            self._global_until = 0.0
+            removed += 1
         if scope in ("all", "chat") and self._chat.pop(key, None) is not None:
             removed += 1
         if scope in ("all", "self") and self._self.pop("{}|{}".format(key, sender_id), None) is not None:
@@ -806,6 +880,8 @@ class Exemptions:
         self._prune()
         current = self._now()
         out = []
+        if self._global_until > current:
+            out.append({"scope": "all", "key": "*", "left_sec": self._global_until - current})
         for scope, table in (("chat", self._chat), ("self", self._self), ("user", self._user)):
             for key, until in table.items():
                 out.append({"scope": scope, "key": key, "left_sec": until - current})
@@ -815,6 +891,7 @@ class Exemptions:
         self._chat.clear()
         self._self.clear()
         self._user.clear()
+        self._global_until = 0.0
 
 
 # ───────────────────────────────────────────── 限流闸
@@ -922,7 +999,14 @@ class RateGate:
 
 
 class TtlCache:
-    """极简 TTL 缓存：曲库索引（5 分钟）与 ID3 标签（30 分钟）都用它。"""
+    """极简 TTL 缓存：曲库索引（5 分钟）与 ID3 标签（30 分钟）都用它。
+
+    ⚠️ 必须带锁：两个调用点都在 ``asyncio.to_thread`` 里（``library.load_library``
+    与 ``library.with_tags``），两个群同时点歌时是真并行。``set()`` 淘汰最旧一条要
+    遍历整个字典，另一个线程这时插入/删除就会抛
+    ``RuntimeError: dictionary changed size during iteration`` —— 而
+    ``_load_library`` 的兜底是「返回空曲库」，于是本地明明有歌也会被判成没有、转去下载。
+    """
 
     def __init__(
         self,
@@ -935,24 +1019,29 @@ class TtlCache:
         self._now = now or time.monotonic
         self._max = max(1, int(max_size))
         self._items: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.Lock()
 
     def get(self, key: Any) -> Any:
-        item = self._items.get(str(key))
-        if item is None:
-            return None
-        if self._now() - item["at"] > self._ttl_sec:
-            self._items.pop(str(key), None)
-            return None
-        return item["value"]
+        name = str(key)
+        with self._lock:
+            item = self._items.get(name)
+            if item is None:
+                return None
+            if self._now() - item["at"] > self._ttl_sec:
+                self._items.pop(name, None)
+                return None
+            return item["value"]
 
     def set(self, key: Any, value: Any) -> Any:
         name = str(key)
-        if len(self._items) >= self._max:
-            oldest = min(self._items.items(), key=lambda item: item[1]["at"], default=None)
-            if oldest is not None:
-                self._items.pop(oldest[0], None)
-        self._items[name] = {"at": self._now(), "value": value}
+        with self._lock:
+            if len(self._items) >= self._max:
+                oldest = min(self._items.items(), key=lambda item: item[1]["at"], default=None)
+                if oldest is not None:
+                    self._items.pop(oldest[0], None)
+            self._items[name] = {"at": self._now(), "value": value}
         return value
 
     def clear(self) -> None:
-        self._items.clear()
+        with self._lock:
+            self._items.clear()
